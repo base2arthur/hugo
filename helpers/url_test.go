@@ -14,19 +14,19 @@
 package helpers
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 
-	"github.com/spf13/viper"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	qt "github.com/frankban/quicktest"
+	"github.com/gohugoio/hugo/hugofs"
+	"github.com/gohugoio/hugo/langs"
 )
 
 func TestURLize(t *testing.T) {
-	initCommonTestConfig()
 
-	p := NewPathSpecFromConfig(viper.GetViper())
+	v := newTestCfg()
+	l := langs.NewDefaultLanguage(v)
+	p, _ := NewPathSpec(hugofs.NewMem(v), l, nil)
 
 	tests := []struct {
 		input    string
@@ -61,11 +61,10 @@ func TestAbsURL(t *testing.T) {
 }
 
 func doTestAbsURL(t *testing.T, defaultInSubDir, addLanguage, multilingual bool, lang string) {
-	viper.Reset()
-	viper.Set("multilingual", multilingual)
-	viper.Set("currentContentLanguage", NewLanguage(lang))
-	viper.Set("defaultContentLanguage", "en")
-	viper.Set("defaultContentLanguageInSubdir", defaultInSubDir)
+	v := newTestCfg()
+	v.Set("multilingual", multilingual)
+	v.Set("defaultContentLanguage", "en")
+	v.Set("defaultContentLanguageInSubdir", defaultInSubDir)
 
 	tests := []struct {
 		input    string
@@ -86,8 +85,11 @@ func doTestAbsURL(t *testing.T, defaultInSubDir, addLanguage, multilingual bool,
 	}
 
 	for _, test := range tests {
-		viper.Set("baseURL", test.baseURL)
-		p := NewPathSpecFromConfig(viper.GetViper())
+		v.Set("baseURL", test.baseURL)
+		v.Set("contentDir", "content")
+		l := langs.NewLanguage(lang, v)
+		p, _ := NewPathSpec(hugofs.NewMem(v), l, nil)
+
 		output := p.AbsURL(test.input, addLanguage)
 		expected := test.expected
 		if multilingual && addLanguage {
@@ -107,7 +109,9 @@ func doTestAbsURL(t *testing.T, defaultInSubDir, addLanguage, multilingual bool,
 }
 
 func TestIsAbsURL(t *testing.T) {
-	for i, this := range []struct {
+	c := qt.New(t)
+
+	for _, this := range []struct {
 		a string
 		b bool
 	}{
@@ -118,7 +122,7 @@ func TestIsAbsURL(t *testing.T) {
 		{"/content", false},
 		{"content", false},
 	} {
-		require.True(t, IsAbsURL(this.a) == this.b, fmt.Sprintf("Test %d", i))
+		c.Assert(IsAbsURL(this.a) == this.b, qt.Equals, true)
 	}
 }
 
@@ -135,11 +139,10 @@ func TestRelURL(t *testing.T) {
 }
 
 func doTestRelURL(t *testing.T, defaultInSubDir, addLanguage, multilingual bool, lang string) {
-	viper.Reset()
-	viper.Set("multilingual", multilingual)
-	viper.Set("currentContentLanguage", NewLanguage(lang))
-	viper.Set("defaultContentLanguage", "en")
-	viper.Set("defaultContentLanguageInSubdir", defaultInSubDir)
+	v := newTestCfg()
+	v.Set("multilingual", multilingual)
+	v.Set("defaultContentLanguage", "en")
+	v.Set("defaultContentLanguageInSubdir", defaultInSubDir)
 
 	tests := []struct {
 		input    string
@@ -162,9 +165,10 @@ func doTestRelURL(t *testing.T, defaultInSubDir, addLanguage, multilingual bool,
 	}
 
 	for i, test := range tests {
-		viper.Set("baseURL", test.baseURL)
-		viper.Set("canonifyURLs", test.canonify)
-		p := NewPathSpecFromConfig(viper.GetViper())
+		v.Set("baseURL", test.baseURL)
+		v.Set("canonifyURLs", test.canonify)
+		l := langs.NewLanguage(lang, v)
+		p, _ := NewPathSpec(hugofs.NewMem(v), l, nil)
 
 		output := p.RelURL(test.input, addLanguage)
 
@@ -247,8 +251,14 @@ func TestURLPrep(t *testing.T) {
 		{false, "/section/name.html", "/section/name/"},
 		{true, "/section/name/index.html", "/section/name.html"},
 	}
+
 	for i, d := range data {
-		output := URLPrep(d.ugly, d.input)
+		v := newTestCfg()
+		v.Set("uglyURLs", d.ugly)
+		l := langs.NewDefaultLanguage(v)
+		p, _ := NewPathSpec(hugofs.NewMem(v), l, nil)
+
+		output := p.URLPrep(d.input)
 		if d.output != output {
 			t.Errorf("Test #%d failed. Expected %q got %q", i, d.output, output)
 		}
@@ -282,31 +292,33 @@ func TestAddContextRoot(t *testing.T) {
 }
 
 func TestPretty(t *testing.T) {
-	assert.Equal(t, PrettifyURLPath("/section/name.html"), "/section/name/index.html")
-	assert.Equal(t, PrettifyURLPath("/section/sub/name.html"), "/section/sub/name/index.html")
-	assert.Equal(t, PrettifyURLPath("/section/name/"), "/section/name/index.html")
-	assert.Equal(t, PrettifyURLPath("/section/name/index.html"), "/section/name/index.html")
-	assert.Equal(t, PrettifyURLPath("/index.html"), "/index.html")
-	assert.Equal(t, PrettifyURLPath("/name.xml"), "/name/index.xml")
-	assert.Equal(t, PrettifyURLPath("/"), "/")
-	assert.Equal(t, PrettifyURLPath(""), "/")
-	assert.Equal(t, PrettifyURL("/section/name.html"), "/section/name")
-	assert.Equal(t, PrettifyURL("/section/sub/name.html"), "/section/sub/name")
-	assert.Equal(t, PrettifyURL("/section/name/"), "/section/name")
-	assert.Equal(t, PrettifyURL("/section/name/index.html"), "/section/name")
-	assert.Equal(t, PrettifyURL("/index.html"), "/")
-	assert.Equal(t, PrettifyURL("/name.xml"), "/name/index.xml")
-	assert.Equal(t, PrettifyURL("/"), "/")
-	assert.Equal(t, PrettifyURL(""), "/")
+	c := qt.New(t)
+	c.Assert("/section/name/index.html", qt.Equals, PrettifyURLPath("/section/name.html"))
+	c.Assert("/section/sub/name/index.html", qt.Equals, PrettifyURLPath("/section/sub/name.html"))
+	c.Assert("/section/name/index.html", qt.Equals, PrettifyURLPath("/section/name/"))
+	c.Assert("/section/name/index.html", qt.Equals, PrettifyURLPath("/section/name/index.html"))
+	c.Assert("/index.html", qt.Equals, PrettifyURLPath("/index.html"))
+	c.Assert("/name/index.xml", qt.Equals, PrettifyURLPath("/name.xml"))
+	c.Assert("/", qt.Equals, PrettifyURLPath("/"))
+	c.Assert("/", qt.Equals, PrettifyURLPath(""))
+	c.Assert("/section/name", qt.Equals, PrettifyURL("/section/name.html"))
+	c.Assert("/section/sub/name", qt.Equals, PrettifyURL("/section/sub/name.html"))
+	c.Assert("/section/name", qt.Equals, PrettifyURL("/section/name/"))
+	c.Assert("/section/name", qt.Equals, PrettifyURL("/section/name/index.html"))
+	c.Assert("/", qt.Equals, PrettifyURL("/index.html"))
+	c.Assert("/name/index.xml", qt.Equals, PrettifyURL("/name.xml"))
+	c.Assert("/", qt.Equals, PrettifyURL("/"))
+	c.Assert("/", qt.Equals, PrettifyURL(""))
 }
 
 func TestUgly(t *testing.T) {
-	assert.Equal(t, Uglify("/section/name.html"), "/section/name.html")
-	assert.Equal(t, Uglify("/section/sub/name.html"), "/section/sub/name.html")
-	assert.Equal(t, Uglify("/section/name/"), "/section/name.html")
-	assert.Equal(t, Uglify("/section/name/index.html"), "/section/name.html")
-	assert.Equal(t, Uglify("/index.html"), "/index.html")
-	assert.Equal(t, Uglify("/name.xml"), "/name.xml")
-	assert.Equal(t, Uglify("/"), "/")
-	assert.Equal(t, Uglify(""), "/")
+	c := qt.New(t)
+	c.Assert("/section/name.html", qt.Equals, Uglify("/section/name.html"))
+	c.Assert("/section/sub/name.html", qt.Equals, Uglify("/section/sub/name.html"))
+	c.Assert("/section/name.html", qt.Equals, Uglify("/section/name/"))
+	c.Assert("/section/name.html", qt.Equals, Uglify("/section/name/index.html"))
+	c.Assert("/index.html", qt.Equals, Uglify("/index.html"))
+	c.Assert("/name.xml", qt.Equals, Uglify("/name.xml"))
+	c.Assert("/", qt.Equals, Uglify("/"))
+	c.Assert("/", qt.Equals, Uglify(""))
 }

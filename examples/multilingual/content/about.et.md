@@ -1,11 +1,5 @@
 +++
 title = "Minust"
-linktitle = "Minust"
-url = "/minust"
-
-lang = "et"
-menu = ["et"]
-menu_weight = 30
 +++
 
 Lorem ipsum dolor sit amet, consectetur adipisicing elit. Illum ex deleniti ut tenetur amet accusantium dolores nam provident! Ipsum, dicta voluptatum quas architecto nostrum sapiente eos commodi numquam accusantium reprehenderit.

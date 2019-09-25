@@ -1,4 +1,4 @@
-hugo
+/hugo
 docs/public*
 /.idea
 hugo.exe
@@ -11,3 +11,15 @@ cover.out
 .DS_Store
 *~
 vendor/*/
+*.bench
+*.debug
+coverage*.out
+
+dock.sh
+
+GoBuilds
+dist
+
+resources/sunset.jpg
+
+vendor

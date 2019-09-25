@@ -1,4 +1,4 @@
-// Copyright 2015 The Hugo Authors. All rights reserved.
+// Copyright 2019 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,11 +14,13 @@
 package helpers
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
+	qt "github.com/frankban/quicktest"
+	"github.com/spf13/afero"
 )
 
 func TestGuessType(t *testing.T) {
@@ -33,10 +35,13 @@ func TestGuessType(t *testing.T) {
 		{"adoc", "asciidoc"},
 		{"ad", "asciidoc"},
 		{"rst", "rst"},
+		{"pandoc", "pandoc"},
+		{"pdc", "pandoc"},
 		{"mmark", "mmark"},
 		{"html", "html"},
 		{"htm", "html"},
-		{"excel", "unknown"},
+		{"org", "org"},
+		{"excel", ""},
 	} {
 		result := GuessType(this.in)
 		if result != this.expect {
@@ -59,6 +64,45 @@ func TestFirstUpper(t *testing.T) {
 		result := FirstUpper(this.in)
 		if result != this.expect {
 			t.Errorf("[%d] got %s but expected %s", i, result, this.expect)
+		}
+	}
+}
+
+func TestHasStringsPrefix(t *testing.T) {
+	for i, this := range []struct {
+		s      []string
+		prefix []string
+		expect bool
+	}{
+		{[]string{"a"}, []string{"a"}, true},
+		{[]string{}, []string{}, true},
+		{[]string{"a", "b", "c"}, []string{"a", "b"}, true},
+		{[]string{"d", "a", "b", "c"}, []string{"a", "b"}, false},
+		{[]string{"abra", "ca", "dabra"}, []string{"abra", "ca"}, true},
+		{[]string{"abra", "ca"}, []string{"abra", "ca", "dabra"}, false},
+	} {
+		result := HasStringsPrefix(this.s, this.prefix)
+		if result != this.expect {
+			t.Fatalf("[%d] got %t but expected %t", i, result, this.expect)
+		}
+	}
+}
+
+func TestHasStringsSuffix(t *testing.T) {
+	for i, this := range []struct {
+		s      []string
+		suffix []string
+		expect bool
+	}{
+		{[]string{"a"}, []string{"a"}, true},
+		{[]string{}, []string{}, true},
+		{[]string{"a", "b", "c"}, []string{"b", "c"}, true},
+		{[]string{"abra", "ca", "dabra"}, []string{"abra", "ca"}, false},
+		{[]string{"abra", "ca", "dabra"}, []string{"ca", "dabra"}, true},
+	} {
+		result := HasStringsSuffix(this.s, this.suffix)
+		if result != this.expect {
+			t.Fatalf("[%d] got %t but expected %t", i, result, this.expect)
 		}
 	}
 }
@@ -121,7 +165,29 @@ var containsAdditionalTestData = []struct {
 	{"", []byte(""), false},
 }
 
+func TestSliceToLower(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		value    []string
+		expected []string
+	}{
+		{[]string{"a", "b", "c"}, []string{"a", "b", "c"}},
+		{[]string{"a", "B", "c"}, []string{"a", "b", "c"}},
+		{[]string{"A", "B", "C"}, []string{"a", "b", "c"}},
+	}
+
+	for _, test := range tests {
+		res := SliceToLower(test.value)
+		for i, val := range res {
+			if val != test.expected[i] {
+				t.Errorf("Case mismatch. Expected %s, got %s", test.expected[i], res[i])
+			}
+		}
+	}
+}
+
 func TestReaderContains(t *testing.T) {
+	c := qt.New(t)
 	for i, this := range append(containsBenchTestData, containsAdditionalTestData...) {
 		result := ReaderContains(strings.NewReader(this.v1), this.v2)
 		if result != this.expect {
@@ -129,8 +195,22 @@ func TestReaderContains(t *testing.T) {
 		}
 	}
 
-	assert.False(t, ReaderContains(nil, []byte("a")))
-	assert.False(t, ReaderContains(nil, nil))
+	c.Assert(ReaderContains(nil, []byte("a")), qt.Equals, false)
+	c.Assert(ReaderContains(nil, nil), qt.Equals, false)
+}
+
+func TestGetTitleFunc(t *testing.T) {
+	title := "somewhere over the rainbow"
+	c := qt.New(t)
+
+	c.Assert(GetTitleFunc("go")(title), qt.Equals, "Somewhere Over The Rainbow")
+	c.Assert(GetTitleFunc("chicago")(title), qt.Equals, "Somewhere over the Rainbow")
+	c.Assert(GetTitleFunc("Chicago")(title), qt.Equals, "Somewhere over the Rainbow")
+	c.Assert(GetTitleFunc("ap")(title), qt.Equals, "Somewhere Over the Rainbow")
+	c.Assert(GetTitleFunc("ap")(title), qt.Equals, "Somewhere Over the Rainbow")
+	c.Assert(GetTitleFunc("")(title), qt.Equals, "Somewhere Over the Rainbow")
+	c.Assert(GetTitleFunc("unknown")(title), qt.Equals, "Somewhere Over the Rainbow")
+
 }
 
 func BenchmarkReaderContains(b *testing.B) {
@@ -154,193 +234,168 @@ func TestUniqueStrings(t *testing.T) {
 	}
 }
 
+func TestUniqueStringsReuse(t *testing.T) {
+	in := []string{"a", "b", "a", "b", "c", "", "a", "", "d"}
+	output := UniqueStringsReuse(in)
+	expected := []string{"a", "b", "c", "", "d"}
+	if !reflect.DeepEqual(output, expected) {
+		t.Errorf("Expected %#v, got %#v\n", expected, output)
+	}
+}
+
+func TestUniqueStringsSorted(t *testing.T) {
+	c := qt.New(t)
+	in := []string{"a", "a", "b", "c", "b", "", "a", "", "d"}
+	output := UniqueStringsSorted(in)
+	expected := []string{"", "a", "b", "c", "d"}
+	c.Assert(output, qt.DeepEquals, expected)
+	c.Assert(UniqueStringsSorted(nil), qt.IsNil)
+}
+
 func TestFindAvailablePort(t *testing.T) {
+	c := qt.New(t)
 	addr, err := FindAvailablePort()
-	assert.Nil(t, err)
-	assert.NotNil(t, addr)
-	assert.True(t, addr.Port > 0)
+	c.Assert(err, qt.IsNil)
+	c.Assert(addr, qt.Not(qt.IsNil))
+	c.Assert(addr.Port > 0, qt.Equals, true)
 }
 
-func TestSeq(t *testing.T) {
-	for i, this := range []struct {
-		in     []interface{}
-		expect interface{}
-	}{
-		{[]interface{}{-2, 5}, []int{-2, -1, 0, 1, 2, 3, 4, 5}},
-		{[]interface{}{1, 2, 4}, []int{1, 3}},
-		{[]interface{}{1}, []int{1}},
-		{[]interface{}{3}, []int{1, 2, 3}},
-		{[]interface{}{3.2}, []int{1, 2, 3}},
-		{[]interface{}{0}, []int{}},
-		{[]interface{}{-1}, []int{-1}},
-		{[]interface{}{-3}, []int{-1, -2, -3}},
-		{[]interface{}{3, -2}, []int{3, 2, 1, 0, -1, -2}},
-		{[]interface{}{6, -2, 2}, []int{6, 4, 2}},
-		{[]interface{}{1, 0, 2}, false},
-		{[]interface{}{1, -1, 2}, false},
-		{[]interface{}{2, 1, 1}, false},
-		{[]interface{}{2, 1, 1, 1}, false},
-		{[]interface{}{2001}, false},
-		{[]interface{}{}, false},
-		// TODO(bep) {[]interface{}{t}, false},
-		{nil, false},
-	} {
+func TestFastMD5FromFile(t *testing.T) {
+	fs := afero.NewMemMapFs()
 
-		result, err := Seq(this.in...)
-
-		if b, ok := this.expect.(bool); ok && !b {
-			if err == nil {
-				t.Errorf("[%d] TestSeq didn't return an expected error", i)
-			}
-		} else {
-			if err != nil {
-				t.Errorf("[%d] failed: %s", i, err)
-				continue
-			}
-			if !reflect.DeepEqual(result, this.expect) {
-				t.Errorf("[%d] TestSeq got %v but expected %v", i, result, this.expect)
-			}
-		}
+	if err := afero.WriteFile(fs, "small.txt", []byte("abc"), 0777); err != nil {
+		t.Fatal(err)
 	}
+
+	if err := afero.WriteFile(fs, "small2.txt", []byte("abd"), 0777); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := afero.WriteFile(fs, "bigger.txt", []byte(strings.Repeat("a bc d e", 100)), 0777); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := afero.WriteFile(fs, "bigger2.txt", []byte(strings.Repeat("c d e f g", 100)), 0777); err != nil {
+		t.Fatal(err)
+	}
+
+	c := qt.New(t)
+
+	sf1, err := fs.Open("small.txt")
+	c.Assert(err, qt.IsNil)
+	sf2, err := fs.Open("small2.txt")
+	c.Assert(err, qt.IsNil)
+
+	bf1, err := fs.Open("bigger.txt")
+	c.Assert(err, qt.IsNil)
+	bf2, err := fs.Open("bigger2.txt")
+	c.Assert(err, qt.IsNil)
+
+	defer sf1.Close()
+	defer sf2.Close()
+	defer bf1.Close()
+	defer bf2.Close()
+
+	m1, err := MD5FromFileFast(sf1)
+	c.Assert(err, qt.IsNil)
+	c.Assert(m1, qt.Equals, "e9c8989b64b71a88b4efb66ad05eea96")
+
+	m2, err := MD5FromFileFast(sf2)
+	c.Assert(err, qt.IsNil)
+	c.Assert(m2, qt.Not(qt.Equals), m1)
+
+	m3, err := MD5FromFileFast(bf1)
+	c.Assert(err, qt.IsNil)
+	c.Assert(m3, qt.Not(qt.Equals), m2)
+
+	m4, err := MD5FromFileFast(bf2)
+	c.Assert(err, qt.IsNil)
+	c.Assert(m4, qt.Not(qt.Equals), m3)
+
+	m5, err := MD5FromReader(bf2)
+	c.Assert(err, qt.IsNil)
+	c.Assert(m5, qt.Not(qt.Equals), m4)
 }
 
-func TestDoArithmetic(t *testing.T) {
-	for i, this := range []struct {
-		a      interface{}
-		b      interface{}
-		op     rune
-		expect interface{}
-	}{
-		{3, 2, '+', int64(5)},
-		{3, 2, '-', int64(1)},
-		{3, 2, '*', int64(6)},
-		{3, 2, '/', int64(1)},
-		{3.0, 2, '+', float64(5)},
-		{3.0, 2, '-', float64(1)},
-		{3.0, 2, '*', float64(6)},
-		{3.0, 2, '/', float64(1.5)},
-		{3, 2.0, '+', float64(5)},
-		{3, 2.0, '-', float64(1)},
-		{3, 2.0, '*', float64(6)},
-		{3, 2.0, '/', float64(1.5)},
-		{3.0, 2.0, '+', float64(5)},
-		{3.0, 2.0, '-', float64(1)},
-		{3.0, 2.0, '*', float64(6)},
-		{3.0, 2.0, '/', float64(1.5)},
-		{uint(3), uint(2), '+', uint64(5)},
-		{uint(3), uint(2), '-', uint64(1)},
-		{uint(3), uint(2), '*', uint64(6)},
-		{uint(3), uint(2), '/', uint64(1)},
-		{uint(3), 2, '+', uint64(5)},
-		{uint(3), 2, '-', uint64(1)},
-		{uint(3), 2, '*', uint64(6)},
-		{uint(3), 2, '/', uint64(1)},
-		{3, uint(2), '+', uint64(5)},
-		{3, uint(2), '-', uint64(1)},
-		{3, uint(2), '*', uint64(6)},
-		{3, uint(2), '/', uint64(1)},
-		{uint(3), -2, '+', int64(1)},
-		{uint(3), -2, '-', int64(5)},
-		{uint(3), -2, '*', int64(-6)},
-		{uint(3), -2, '/', int64(-1)},
-		{-3, uint(2), '+', int64(-1)},
-		{-3, uint(2), '-', int64(-5)},
-		{-3, uint(2), '*', int64(-6)},
-		{-3, uint(2), '/', int64(-1)},
-		{uint(3), 2.0, '+', float64(5)},
-		{uint(3), 2.0, '-', float64(1)},
-		{uint(3), 2.0, '*', float64(6)},
-		{uint(3), 2.0, '/', float64(1.5)},
-		{3.0, uint(2), '+', float64(5)},
-		{3.0, uint(2), '-', float64(1)},
-		{3.0, uint(2), '*', float64(6)},
-		{3.0, uint(2), '/', float64(1.5)},
-		{0, 0, '+', 0},
-		{0, 0, '-', 0},
-		{0, 0, '*', 0},
-		{"foo", "bar", '+', "foobar"},
-		{3, 0, '/', false},
-		{3.0, 0, '/', false},
-		{3, 0.0, '/', false},
-		{uint(3), uint(0), '/', false},
-		{3, uint(0), '/', false},
-		{-3, uint(0), '/', false},
-		{uint(3), 0, '/', false},
-		{3.0, uint(0), '/', false},
-		{uint(3), 0.0, '/', false},
-		{3, "foo", '+', false},
-		{3.0, "foo", '+', false},
-		{uint(3), "foo", '+', false},
-		{"foo", 3, '+', false},
-		{"foo", "bar", '-', false},
-		{3, 2, '%', false},
-	} {
-		result, err := DoArithmetic(this.a, this.b, this.op)
-		if b, ok := this.expect.(bool); ok && !b {
-			if err == nil {
-				t.Errorf("[%d] doArithmetic didn't return an expected error", i)
+func BenchmarkMD5FromFileFast(b *testing.B) {
+	fs := afero.NewMemMapFs()
+
+	for _, full := range []bool{false, true} {
+		b.Run(fmt.Sprintf("full=%t", full), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				if err := afero.WriteFile(fs, "file.txt", []byte(strings.Repeat("1234567890", 2000)), 0777); err != nil {
+					b.Fatal(err)
+				}
+				f, err := fs.Open("file.txt")
+				if err != nil {
+					b.Fatal(err)
+				}
+				b.StartTimer()
+				if full {
+					if _, err := MD5FromReader(f); err != nil {
+						b.Fatal(err)
+					}
+				} else {
+					if _, err := MD5FromFileFast(f); err != nil {
+						b.Fatal(err)
+					}
+				}
+				f.Close()
 			}
-		} else {
-			if err != nil {
-				t.Errorf("[%d] failed: %s", i, err)
-				continue
-			}
-			if !reflect.DeepEqual(result, this.expect) {
-				t.Errorf("[%d] doArithmetic got %v but expected %v", i, result, this.expect)
-			}
-		}
+		})
 	}
+
 }
 
-func TestToLowerMap(t *testing.T) {
+func BenchmarkUniqueStrings(b *testing.B) {
+	input := []string{"a", "b", "d", "e", "d", "h", "a", "i"}
 
-	tests := []struct {
-		input    map[string]interface{}
-		expected map[string]interface{}
-	}{
-		{
-			map[string]interface{}{
-				"abC": 32,
-			},
-			map[string]interface{}{
-				"abc": 32,
-			},
-		},
-		{
-			map[string]interface{}{
-				"abC": 32,
-				"deF": map[interface{}]interface{}{
-					23: "A value",
-					24: map[string]interface{}{
-						"AbCDe": "A value",
-						"eFgHi": "Another value",
-					},
-				},
-				"gHi": map[string]interface{}{
-					"J": 25,
-				},
-			},
-			map[string]interface{}{
-				"abc": 32,
-				"def": map[string]interface{}{
-					"23": "A value",
-					"24": map[string]interface{}{
-						"abcde": "A value",
-						"efghi": "Another value",
-					},
-				},
-				"ghi": map[string]interface{}{
-					"j": 25,
-				},
-			},
-		},
-	}
-
-	for i, test := range tests {
-		// ToLowerMap modifies input.
-		ToLowerMap(test.input)
-		if !reflect.DeepEqual(test.expected, test.input) {
-			t.Errorf("[%d] Expected\n%#v, got\n%#v\n", i, test.expected, test.input)
+	b.Run("Safe", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			result := UniqueStrings(input)
+			if len(result) != 6 {
+				b.Fatal(fmt.Sprintf("invalid count: %d", len(result)))
+			}
 		}
-	}
+	})
+
+	b.Run("Reuse slice", func(b *testing.B) {
+		b.StopTimer()
+		inputs := make([][]string, b.N)
+		for i := 0; i < b.N; i++ {
+			inputc := make([]string, len(input))
+			copy(inputc, input)
+			inputs[i] = inputc
+		}
+		b.StartTimer()
+		for i := 0; i < b.N; i++ {
+			inputc := inputs[i]
+
+			result := UniqueStringsReuse(inputc)
+			if len(result) != 6 {
+				b.Fatal(fmt.Sprintf("invalid count: %d", len(result)))
+			}
+		}
+	})
+
+	b.Run("Reuse slice sorted", func(b *testing.B) {
+		b.StopTimer()
+		inputs := make([][]string, b.N)
+		for i := 0; i < b.N; i++ {
+			inputc := make([]string, len(input))
+			copy(inputc, input)
+			inputs[i] = inputc
+		}
+		b.StartTimer()
+		for i := 0; i < b.N; i++ {
+			inputc := inputs[i]
+
+			result := UniqueStringsSorted(inputc)
+			if len(result) != 6 {
+				b.Fatal(fmt.Sprintf("invalid count: %d", len(result)))
+			}
+		}
+	})
+
 }

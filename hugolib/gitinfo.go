@@ -1,4 +1,4 @@
-// Copyright 2016-present The Hugo Authors. All rights reserved.
+// Copyright 2019 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,54 +14,34 @@
 package hugolib
 
 import (
-	"path"
 	"path/filepath"
 	"strings"
 
 	"github.com/bep/gitmap"
-	"github.com/spf13/hugo/helpers"
-	jww "github.com/spf13/jwalterweatherman"
-	"github.com/spf13/viper"
+	"github.com/gohugoio/hugo/config"
+	"github.com/gohugoio/hugo/resources/page"
 )
 
-func (h *HugoSites) assembleGitInfo() {
-	if !viper.GetBool("enableGitInfo") {
-		return
-	}
+type gitInfo struct {
+	contentDir string
+	repo       *gitmap.GitRepo
+}
 
-	var (
-		workingDir = viper.GetString("workingDir")
-		contentDir = viper.GetString("contentDir")
-	)
+func (g *gitInfo) forPage(p page.Page) *gitmap.GitInfo {
+	name := strings.TrimPrefix(filepath.ToSlash(p.File().Filename()), g.contentDir)
+	name = strings.TrimPrefix(name, "/")
+
+	return g.repo.Files[name]
+
+}
+
+func newGitInfo(cfg config.Provider) (*gitInfo, error) {
+	workingDir := cfg.GetString("workingDir")
 
 	gitRepo, err := gitmap.Map(workingDir, "")
 	if err != nil {
-		jww.ERROR.Printf("Got error reading Git log: %s", err)
-		return
+		return nil, err
 	}
 
-	gitMap := gitRepo.Files
-	repoPath := filepath.FromSlash(gitRepo.TopLevelAbsPath)
-
-	// The Hugo site may be placed in a sub folder in the Git repo,
-	// one example being the Hugo docs.
-	// We have to find the root folder to the Hugo site below the Git root.
-	contentRoot := strings.TrimPrefix(workingDir, repoPath)
-	contentRoot = strings.TrimPrefix(contentRoot, helpers.FilePathSeparator)
-
-	s := h.Sites[0]
-
-	for _, p := range s.AllPages {
-		// Git normalizes file paths on this form:
-		filename := path.Join(contentRoot, contentDir, filepath.ToSlash(p.Path()))
-		g, ok := gitMap[filename]
-		if !ok {
-			jww.ERROR.Printf("Failed to find GitInfo for %q", filename)
-			return
-		}
-
-		p.GitInfo = g
-		p.Lastmod = p.GitInfo.AuthorDate
-	}
-
+	return &gitInfo{contentDir: gitRepo.TopLevelAbsPath, repo: gitRepo}, nil
 }

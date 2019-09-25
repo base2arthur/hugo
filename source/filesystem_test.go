@@ -14,74 +14,32 @@
 package source
 
 import (
-	"bytes"
+	"fmt"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"testing"
+
+	"github.com/gohugoio/hugo/modules"
+
+	"github.com/gohugoio/hugo/langs"
+
+	"github.com/spf13/afero"
+
+	qt "github.com/frankban/quicktest"
+	"github.com/gohugoio/hugo/helpers"
+	"github.com/gohugoio/hugo/hugofs"
+
+	"github.com/spf13/viper"
 )
 
 func TestEmptySourceFilesystem(t *testing.T) {
-	src := &Filesystem{Base: "Empty"}
-	if len(src.Files()) != 0 {
+	c := qt.New(t)
+	ss := newTestSourceSpec()
+	src := ss.NewFilesystem("")
+	files, err := src.Files()
+	c.Assert(err, qt.IsNil)
+	if len(files) != 0 {
 		t.Errorf("new filesystem should contain 0 files.")
-	}
-}
-
-type TestPath struct {
-	filename string
-	logical  string
-	content  string
-	section  string
-	dir      string
-}
-
-func TestAddFile(t *testing.T) {
-	tests := platformPaths
-	for _, test := range tests {
-		base := platformBase
-		srcDefault := new(Filesystem)
-		srcWithBase := &Filesystem{
-			Base: base,
-		}
-
-		for _, src := range []*Filesystem{srcDefault, srcWithBase} {
-
-			p := test.filename
-			if !filepath.IsAbs(test.filename) {
-				p = filepath.Join(src.Base, test.filename)
-			}
-
-			if err := src.add(p, bytes.NewReader([]byte(test.content))); err != nil {
-				if err.Error() == "source: missing base directory" {
-					continue
-				}
-				t.Fatalf("%s add returned an error: %s", p, err)
-			}
-
-			if len(src.Files()) != 1 {
-				t.Fatalf("%s Files() should return 1 file", p)
-			}
-
-			f := src.Files()[0]
-			if f.LogicalName() != test.logical {
-				t.Errorf("Filename (Base: %q) expected: %q, got: %q", src.Base, test.logical, f.LogicalName())
-			}
-
-			b := new(bytes.Buffer)
-			b.ReadFrom(f.Contents)
-			if b.String() != test.content {
-				t.Errorf("File (Base: %q) contents should be %q, got: %q", src.Base, test.content, b.String())
-			}
-
-			if f.Section() != test.section {
-				t.Errorf("File section (Base: %q) expected: %q, got: %q", src.Base, test.section, f.Section())
-			}
-
-			if f.Dir() != test.dir {
-				t.Errorf("Dir path (Base: %q) expected: %q, got: %q", src.Base, test.dir, f.Dir())
-			}
-		}
 	}
 }
 
@@ -91,6 +49,8 @@ func TestUnicodeNorm(t *testing.T) {
 		return
 	}
 
+	c := qt.New(t)
+
 	paths := []struct {
 		NFC string
 		NFD string
@@ -99,13 +59,53 @@ func TestUnicodeNorm(t *testing.T) {
 		{NFC: "é", NFD: "\x65\xcc\x81"},
 	}
 
-	for _, path := range paths {
-		src := new(Filesystem)
-		_ = src.add(path.NFD, strings.NewReader(""))
-		f := src.Files()[0]
+	ss := newTestSourceSpec()
+	fi := hugofs.NewFileMetaInfo(nil, hugofs.FileMeta{})
+
+	for i, path := range paths {
+		base := fmt.Sprintf("base%d", i)
+		c.Assert(afero.WriteFile(ss.Fs.Source, filepath.Join(base, path.NFD), []byte("some data"), 0777), qt.IsNil)
+		src := ss.NewFilesystem(base)
+		_ = src.add(path.NFD, fi)
+		files, err := src.Files()
+		c.Assert(err, qt.IsNil)
+		f := files[0]
 		if f.BaseFileName() != path.NFC {
-			t.Fatalf("file name in NFD form should be normalized (%s)", path.NFC)
+			t.Fatalf("file %q name in NFD form should be normalized (%s)", f.BaseFileName(), path.NFC)
 		}
 	}
 
+}
+
+func newTestConfig() *viper.Viper {
+	v := viper.New()
+	v.Set("contentDir", "content")
+	v.Set("dataDir", "data")
+	v.Set("i18nDir", "i18n")
+	v.Set("layoutDir", "layouts")
+	v.Set("archetypeDir", "archetypes")
+	v.Set("resourceDir", "resources")
+	v.Set("publishDir", "public")
+	v.Set("assetDir", "assets")
+	_, err := langs.LoadLanguageSettings(v, nil)
+	if err != nil {
+		panic(err)
+	}
+	mod, err := modules.CreateProjectModule(v)
+	if err != nil {
+		panic(err)
+	}
+	v.Set("allModules", modules.Modules{mod})
+
+	return v
+}
+
+func newTestSourceSpec() *SourceSpec {
+	v := newTestConfig()
+	fs := hugofs.NewFrom(hugofs.NewBaseFileDecorator(afero.NewMemMapFs()), v)
+	ps, err := helpers.NewPathSpec(fs, v, nil)
+	if err != nil {
+		panic(err)
+	}
+	return NewSourceSpec(ps, fs.Source)
 }

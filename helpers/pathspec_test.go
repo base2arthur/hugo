@@ -1,4 +1,4 @@
-// Copyright 2016-present The Hugo Authors. All rights reserved.
+// Copyright 2018 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,32 +14,47 @@
 package helpers
 
 import (
+	"path/filepath"
 	"testing"
 
-	"github.com/spf13/viper"
-	"github.com/stretchr/testify/require"
+	qt "github.com/frankban/quicktest"
+	"github.com/gohugoio/hugo/hugofs"
+
+	"github.com/gohugoio/hugo/langs"
 )
 
 func TestNewPathSpecFromConfig(t *testing.T) {
-	viper.Set("disablePathToLower", true)
-	viper.Set("removePathAccents", true)
-	viper.Set("uglyURLs", true)
-	viper.Set("multilingual", true)
-	viper.Set("defaultContentLanguageInSubdir", true)
-	viper.Set("defaultContentLanguage", "no")
-	viper.Set("currentContentLanguage", NewLanguage("no"))
-	viper.Set("canonifyURLs", true)
-	viper.Set("paginatePath", "side")
+	c := qt.New(t)
+	v := newTestCfg()
+	l := langs.NewLanguage("no", v)
+	v.Set("disablePathToLower", true)
+	v.Set("removePathAccents", true)
+	v.Set("uglyURLs", true)
+	v.Set("canonifyURLs", true)
+	v.Set("paginatePath", "side")
+	v.Set("baseURL", "http://base.com")
+	v.Set("themesDir", "thethemes")
+	v.Set("layoutDir", "thelayouts")
+	v.Set("workingDir", "thework")
+	v.Set("staticDir", "thestatic")
+	v.Set("theme", "thetheme")
+	langs.LoadLanguageSettings(v, nil)
 
-	pathSpec := NewPathSpecFromConfig(viper.GetViper())
+	fs := hugofs.NewMem(v)
+	fs.Source.MkdirAll(filepath.FromSlash("thework/thethemes/thetheme"), 0777)
 
-	require.True(t, pathSpec.canonifyURLs)
-	require.True(t, pathSpec.defaultContentLanguageInSubdir)
-	require.True(t, pathSpec.disablePathToLower)
-	require.True(t, pathSpec.multilingual)
-	require.True(t, pathSpec.removePathAccents)
-	require.True(t, pathSpec.uglyURLs)
-	require.Equal(t, "no", pathSpec.defaultContentLanguage)
-	require.Equal(t, "no", pathSpec.currentContentLanguage.Lang)
-	require.Equal(t, "side", pathSpec.paginatePath)
+	p, err := NewPathSpec(fs, l, nil)
+
+	c.Assert(err, qt.IsNil)
+	c.Assert(p.CanonifyURLs, qt.Equals, true)
+	c.Assert(p.DisablePathToLower, qt.Equals, true)
+	c.Assert(p.RemovePathAccents, qt.Equals, true)
+	c.Assert(p.UglyURLs, qt.Equals, true)
+	c.Assert(p.Language.Lang, qt.Equals, "no")
+	c.Assert(p.PaginatePath, qt.Equals, "side")
+
+	c.Assert(p.BaseURL.String(), qt.Equals, "http://base.com")
+	c.Assert(p.ThemesDir, qt.Equals, "thethemes")
+	c.Assert(p.WorkingDir, qt.Equals, "thework")
+
 }

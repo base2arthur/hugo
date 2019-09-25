@@ -16,66 +16,46 @@ package hugofs
 import (
 	"testing"
 
+	qt "github.com/frankban/quicktest"
+	"github.com/gohugoio/hugo/htesting/hqt"
 	"github.com/spf13/afero"
 	"github.com/spf13/viper"
-	"github.com/stretchr/testify/assert"
 )
 
-func TestInitDefault(t *testing.T) {
-	viper.Reset()
-	defer viper.Reset()
+func TestNewDefault(t *testing.T) {
+	c := qt.New(t)
+	v := viper.New()
+	f := NewDefault(v)
 
-	InitDefaultFs()
+	c.Assert(f.Source, qt.Not(qt.IsNil))
+	c.Assert(f.Source, hqt.IsSameType, new(afero.OsFs))
+	c.Assert(f.Os, qt.Not(qt.IsNil))
+	c.Assert(f.WorkingDir, qt.IsNil)
 
-	assert.NotNil(t, Source())
-	assert.IsType(t, new(afero.OsFs), Source())
-	assert.NotNil(t, Destination())
-	assert.IsType(t, new(afero.OsFs), Destination())
-	assert.NotNil(t, Os())
-	assert.IsType(t, new(afero.OsFs), Os())
-	assert.Nil(t, WorkingDir())
 }
 
-func TestInitMemFs(t *testing.T) {
-	viper.Reset()
-	defer viper.Reset()
+func TestNewMem(t *testing.T) {
+	c := qt.New(t)
+	v := viper.New()
+	f := NewMem(v)
 
-	InitMemFs()
-
-	assert.NotNil(t, Source())
-	assert.IsType(t, new(afero.MemMapFs), Source())
-	assert.NotNil(t, Destination())
-	assert.IsType(t, new(afero.MemMapFs), Destination())
-	assert.IsType(t, new(afero.OsFs), Os())
-	assert.Nil(t, WorkingDir())
-}
-
-func TestSetSource(t *testing.T) {
-
-	InitMemFs()
-
-	SetSource(new(afero.OsFs))
-	assert.NotNil(t, Source())
-	assert.IsType(t, new(afero.OsFs), Source())
-}
-
-func TestSetDestination(t *testing.T) {
-
-	InitMemFs()
-
-	SetDestination(new(afero.OsFs))
-	assert.NotNil(t, Destination())
-	assert.IsType(t, new(afero.OsFs), Destination())
+	c.Assert(f.Source, qt.Not(qt.IsNil))
+	c.Assert(f.Source, hqt.IsSameType, new(afero.MemMapFs))
+	c.Assert(f.Destination, qt.Not(qt.IsNil))
+	c.Assert(f.Destination, hqt.IsSameType, new(afero.MemMapFs))
+	c.Assert(f.Os, hqt.IsSameType, new(afero.OsFs))
+	c.Assert(f.WorkingDir, qt.IsNil)
 }
 
 func TestWorkingDir(t *testing.T) {
-	viper.Reset()
-	defer viper.Reset()
+	c := qt.New(t)
+	v := viper.New()
 
-	viper.Set("workingDir", "/a/b/")
+	v.Set("workingDir", "/a/b/")
 
-	InitMemFs()
+	f := NewMem(v)
 
-	assert.NotNil(t, WorkingDir())
-	assert.IsType(t, new(afero.BasePathFs), WorkingDir())
+	c.Assert(f.WorkingDir, qt.Not(qt.IsNil))
+	c.Assert(f.WorkingDir, hqt.IsSameType, new(afero.BasePathFs))
+
 }

@@ -1,4 +1,4 @@
-// Copyright 2016-present The Hugo Authors. All rights reserved.
+// Copyright 2019 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,27 +16,27 @@ package hugolib
 import (
 	"sync"
 
-	"sort"
-
 	"errors"
-	"fmt"
 
-	"github.com/spf13/cast"
-	"github.com/spf13/hugo/helpers"
+	"github.com/gohugoio/hugo/langs"
+
+	"github.com/gohugoio/hugo/config"
 )
 
+// Multilingual manages the all languages used in a multilingual site.
 type Multilingual struct {
-	Languages helpers.Languages
+	Languages langs.Languages
 
-	DefaultLang *helpers.Language
+	DefaultLang *langs.Language
 
-	langMap     map[string]*helpers.Language
+	langMap     map[string]*langs.Language
 	langMapInit sync.Once
 }
 
-func (ml *Multilingual) Language(lang string) *helpers.Language {
+// Language returns the Language associated with the given string.
+func (ml *Multilingual) Language(lang string) *langs.Language {
 	ml.langMapInit.Do(func() {
-		ml.langMap = make(map[string]*helpers.Language)
+		ml.langMap = make(map[string]*langs.Language)
 		for _, l := range ml.Languages {
 			ml.langMap[l.Lang] = l
 		}
@@ -44,71 +44,41 @@ func (ml *Multilingual) Language(lang string) *helpers.Language {
 	return ml.langMap[lang]
 }
 
-func newMultiLingualFromSites(sites ...*Site) (*Multilingual, error) {
-	languages := make(helpers.Languages, len(sites))
-
-	for i, s := range sites {
-		if s.Language == nil {
-			return nil, errors.New("Missing language for site")
-		}
-		languages[i] = s.Language
+func getLanguages(cfg config.Provider) langs.Languages {
+	if cfg.IsSet("languagesSorted") {
+		return cfg.Get("languagesSorted").(langs.Languages)
 	}
 
-	return &Multilingual{Languages: languages, DefaultLang: helpers.NewDefaultLanguage()}, nil
+	return langs.Languages{langs.NewDefaultLanguage(cfg)}
+}
+
+func newMultiLingualFromSites(cfg config.Provider, sites ...*Site) (*Multilingual, error) {
+	languages := make(langs.Languages, len(sites))
+
+	for i, s := range sites {
+		if s.language == nil {
+			return nil, errors.New("missing language for site")
+		}
+		languages[i] = s.language
+	}
+
+	defaultLang := cfg.GetString("defaultContentLanguage")
+
+	if defaultLang == "" {
+		defaultLang = "en"
+	}
+
+	return &Multilingual{Languages: languages, DefaultLang: langs.NewLanguage(defaultLang, cfg)}, nil
 
 }
 
-func newMultiLingualDefaultLanguage() *Multilingual {
-	return newMultiLingualForLanguage(helpers.NewDefaultLanguage())
-}
-
-func newMultiLingualForLanguage(language *helpers.Language) *Multilingual {
-	languages := helpers.Languages{language}
-	return &Multilingual{Languages: languages, DefaultLang: language}
-}
 func (ml *Multilingual) enabled() bool {
 	return len(ml.Languages) > 1
 }
 
 func (s *Site) multilingualEnabled() bool {
-	if s.owner == nil {
+	if s.h == nil {
 		return false
 	}
-	return s.owner.multilingual != nil && s.owner.multilingual.enabled()
-}
-
-func toSortedLanguages(l map[string]interface{}) (helpers.Languages, error) {
-	langs := make(helpers.Languages, len(l))
-	i := 0
-
-	for lang, langConf := range l {
-		langsMap, err := cast.ToStringMapE(langConf)
-
-		if err != nil {
-			return nil, fmt.Errorf("Language config is not a map: %T", langConf)
-		}
-
-		language := helpers.NewLanguage(lang)
-
-		for loki, v := range langsMap {
-			switch loki {
-			case "title":
-				language.Title = cast.ToString(v)
-			case "languagename":
-				language.LanguageName = cast.ToString(v)
-			case "weight":
-				language.Weight = cast.ToInt(v)
-			}
-
-			// Put all into the Params map
-			language.SetParam(loki, v)
-		}
-
-		langs[i] = language
-		i++
-	}
-
-	sort.Sort(langs)
-
-	return langs, nil
+	return s.h.multilingual != nil && s.h.multilingual.enabled()
 }
