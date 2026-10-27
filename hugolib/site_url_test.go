@@ -1,4 +1,4 @@
-// Copyright 2016 The Hugo Authors. All rights reserved.
+// Copyright 2025 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,91 +14,45 @@
 package hugolib
 
 import (
-	"path/filepath"
+	"strings"
 	"testing"
-
-	"github.com/spf13/hugo/helpers"
-
-	"html/template"
-
-	"github.com/spf13/hugo/hugofs"
-	"github.com/spf13/hugo/source"
-	"github.com/spf13/viper"
 )
 
-const slugDoc1 = "---\ntitle: slug doc 1\nslug: slug-doc-1\naliases:\n - sd1/foo/\n - sd2\n - sd3/\n - sd4.html\n---\nslug doc 1 content\n"
+func TestSectionsEntries(t *testing.T) {
+	files := `
+-- hugo.toml --
+-- content/withfile/_index.md --
+-- content/withoutfile/p1.md --
+-- layouts/list.html --
+SectionsEntries: {{ .SectionsEntries }}
 
-const slugDoc2 = `---
-title: slug doc 2
-slug: slug-doc-2
----
-slug doc 2 content
+
 `
 
-const indexTemplate = "{{ range .Data.Pages }}.{{ end }}"
+	b := Test(t, files)
 
-func must(err error) {
-	if err != nil {
-		panic(err)
-	}
+	b.AssertFileContent("public/withfile/index.html", "SectionsEntries: [withfile]")
+	b.AssertFileContent("public/withoutfile/index.html", "SectionsEntries: [withoutfile]")
 }
 
-var urlFakeSource = []source.ByteSource{
-	{Name: filepath.FromSlash("content/blue/doc1.md"), Content: []byte(slugDoc1)},
-	{Name: filepath.FromSlash("content/blue/doc2.md"), Content: []byte(slugDoc2)},
-}
+// See #14625.
+func TestDefaultBaseURL(t *testing.T) {
+	filesTemplate := `
+-- hugo.toml --
+CONFIG
+-- content/_index.md --
+-- layouts/list.html --
+BaseURL: {{ .Site.BaseURL }}
+`
+	files := strings.ReplaceAll(filesTemplate, "CONFIG", `baseURL = "https://example.com/"`)
+	b := Test(t, files)
+	b.AssertFileContent("public/index.html", "BaseURL: https://example.com/")
 
-// Issue #1105
-func TestShouldNotAddTrailingSlashToBaseURL(t *testing.T) {
-	testCommonResetState()
+	files = strings.ReplaceAll(filesTemplate, "CONFIG", "")
+	b = Test(t, files)
+	b.AssertFileContent("public/index.html", "BaseURL: https://example.org/")
 
-	for i, this := range []struct {
-		in       string
-		expected string
-	}{
-		{"http://base.com/", "http://base.com/"},
-		{"http://base.com/sub/", "http://base.com/sub/"},
-		{"http://base.com/sub", "http://base.com/sub"},
-		{"http://base.com", "http://base.com"}} {
-
-		viper.Set("baseURL", this.in)
-		s := newSiteDefaultLang()
-		s.initializeSiteInfo()
-
-		if s.Info.BaseURL != template.URL(this.expected) {
-			t.Errorf("[%d] got %s expected %s", i, s.Info.BaseURL, this.expected)
-		}
-	}
-
-}
-
-func TestPageCount(t *testing.T) {
-	testCommonResetState()
-	hugofs.InitMemFs()
-
-	viper.Set("uglyURLs", false)
-	viper.Set("paginate", 10)
-	s := &Site{
-		Source:   &source.InMemorySource{ByteSource: urlFakeSource},
-		Language: helpers.NewDefaultLanguage(),
-	}
-
-	if err := buildAndRenderSite(s, "indexes/blue.html", indexTemplate); err != nil {
-		t.Fatalf("Failed to build site: %s", err)
-	}
-	_, err := hugofs.Destination().Open("public/blue")
-	if err != nil {
-		t.Errorf("No indexed rendered.")
-	}
-
-	for _, s := range []string{
-		"public/sd1/foo/index.html",
-		"public/sd2/index.html",
-		"public/sd3/index.html",
-		"public/sd4.html",
-	} {
-		if _, err := hugofs.Destination().Open(filepath.FromSlash(s)); err != nil {
-			t.Errorf("No alias rendered: %s", s)
-		}
-	}
+	files = strings.ReplaceAll(filesTemplate, "CONFIG", `baseURL = "/"`)
+	b = Test(t, files)
+	b.AssertFileContent("public/index.html", "BaseURL: /")
 }

@@ -1,4 +1,4 @@
-// Copyright 2015 The Hugo Authors. All rights reserved.
+// Copyright 2024 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,18 +14,22 @@
 package main
 
 import (
-	"runtime"
-
-	"github.com/spf13/hugo/commands"
-	jww "github.com/spf13/jwalterweatherman"
+	"log"
 	"os"
+
+	"github.com/gohugoio/hugo/common/herrors"
+	"github.com/gohugoio/hugo/common/loggers"
+
+	"github.com/gohugoio/hugo/commands"
 )
 
 func main() {
-	runtime.GOMAXPROCS(runtime.NumCPU())
-	commands.Execute()
-
-	if jww.LogCountForLevelsGreaterThanorEqualTo(jww.LevelError) > 0 {
-		os.Exit(-1)
+	log.SetFlags(0)
+	err := commands.Execute(os.Args[1:])
+	if err != nil {
+		for _, e := range herrors.Errors(err) {
+			loggers.Log().Errorf("%s", e)
+		}
+		os.Exit(1)
 	}
 }

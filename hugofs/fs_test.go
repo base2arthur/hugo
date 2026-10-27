@@ -16,66 +16,35 @@ package hugofs
 import (
 	"testing"
 
+	"github.com/gohugoio/hugo/config"
+
+	qt "github.com/frankban/quicktest"
+	"github.com/gohugoio/hugo/htesting/hqt"
 	"github.com/spf13/afero"
-	"github.com/spf13/viper"
-	"github.com/stretchr/testify/assert"
 )
 
-func TestInitDefault(t *testing.T) {
-	viper.Reset()
-	defer viper.Reset()
+func TestIsOsFs(t *testing.T) {
+	c := qt.New(t)
 
-	InitDefaultFs()
-
-	assert.NotNil(t, Source())
-	assert.IsType(t, new(afero.OsFs), Source())
-	assert.NotNil(t, Destination())
-	assert.IsType(t, new(afero.OsFs), Destination())
-	assert.NotNil(t, Os())
-	assert.IsType(t, new(afero.OsFs), Os())
-	assert.Nil(t, WorkingDir())
+	c.Assert(IsOsFs(Os), qt.Equals, true)
+	c.Assert(IsOsFs(&afero.MemMapFs{}), qt.Equals, false)
+	c.Assert(IsOsFs(NewBasePathFs(&afero.MemMapFs{}, "/public")), qt.Equals, false)
+	c.Assert(IsOsFs(NewBasePathFs(Os, t.TempDir())), qt.Equals, true)
 }
 
-func TestInitMemFs(t *testing.T) {
-	viper.Reset()
-	defer viper.Reset()
+func TestNewDefault(t *testing.T) {
+	c := qt.New(t)
+	v := config.New()
+	v.Set("workingDir", t.TempDir())
+	v.Set("publishDir", "public")
+	f := NewDefault(v)
 
-	InitMemFs()
-
-	assert.NotNil(t, Source())
-	assert.IsType(t, new(afero.MemMapFs), Source())
-	assert.NotNil(t, Destination())
-	assert.IsType(t, new(afero.MemMapFs), Destination())
-	assert.IsType(t, new(afero.OsFs), Os())
-	assert.Nil(t, WorkingDir())
-}
-
-func TestSetSource(t *testing.T) {
-
-	InitMemFs()
-
-	SetSource(new(afero.OsFs))
-	assert.NotNil(t, Source())
-	assert.IsType(t, new(afero.OsFs), Source())
-}
-
-func TestSetDestination(t *testing.T) {
-
-	InitMemFs()
-
-	SetDestination(new(afero.OsFs))
-	assert.NotNil(t, Destination())
-	assert.IsType(t, new(afero.OsFs), Destination())
-}
-
-func TestWorkingDir(t *testing.T) {
-	viper.Reset()
-	defer viper.Reset()
-
-	viper.Set("workingDir", "/a/b/")
-
-	InitMemFs()
-
-	assert.NotNil(t, WorkingDir())
-	assert.IsType(t, new(afero.BasePathFs), WorkingDir())
+	c.Assert(f.Source, qt.IsNotNil)
+	c.Assert(f.Source, hqt.IsSameType, new(afero.OsFs))
+	c.Assert(f.Os, qt.IsNotNil)
+	c.Assert(f.WorkingDirReadOnly, qt.IsNotNil)
+	c.Assert(IsOsFs(f.WorkingDirReadOnly), qt.IsTrue)
+	c.Assert(IsOsFs(f.Source), qt.IsTrue)
+	c.Assert(IsOsFs(f.PublishDir), qt.IsTrue)
+	c.Assert(IsOsFs(f.Os), qt.IsTrue)
 }

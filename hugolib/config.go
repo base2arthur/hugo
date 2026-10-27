@@ -1,4 +1,4 @@
-// Copyright 2016-present The Hugo Authors. All rights reserved.
+// Copyright 2019 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,96 +14,171 @@
 package hugolib
 
 import (
-	"fmt"
+	"os"
+	"path/filepath"
 
-	"github.com/spf13/hugo/helpers"
-	"github.com/spf13/viper"
+	"github.com/gohugoio/hugo/config"
+	"github.com/gohugoio/hugo/config/allconfig"
+	"github.com/spf13/afero"
 )
 
-// LoadGlobalConfig loads Hugo configuration into the global Viper.
-func LoadGlobalConfig(relativeSourcePath, configFilename string) error {
-	if relativeSourcePath == "" {
-		relativeSourcePath = "."
-	}
-
-	viper.AutomaticEnv()
-	viper.SetEnvPrefix("hugo")
-	viper.SetConfigFile(configFilename)
-	// See https://github.com/spf13/viper/issues/73#issuecomment-126970794
-	if relativeSourcePath == "" {
-		viper.AddConfigPath(".")
-	} else {
-		viper.AddConfigPath(relativeSourcePath)
-	}
-	err := viper.ReadInConfig()
+// DefaultConfig returns the default configuration.
+func DefaultConfig() *allconfig.Config {
+	fs := afero.NewMemMapFs()
+	all, err := allconfig.LoadConfig(allconfig.ConfigSourceDescriptor{Fs: fs, Environ: []string{"none"}})
 	if err != nil {
-		if _, ok := err.(viper.ConfigParseError); ok {
-			return err
-		}
-		return fmt.Errorf("Unable to locate Config file. Perhaps you need to create a new site.\n       Run `hugo help new` for details. (%s)\n", err)
+		panic(err)
 	}
-
-	viper.RegisterAlias("indexes", "taxonomies")
-
-	loadDefaultSettings()
-
-	return nil
+	return all.Base
 }
 
-func loadDefaultSettings() {
-	viper.SetDefault("cleanDestinationDir", false)
-	viper.SetDefault("watch", false)
-	viper.SetDefault("metaDataFormat", "toml")
-	viper.SetDefault("disable404", false)
-	viper.SetDefault("disableRSS", false)
-	viper.SetDefault("disableSitemap", false)
-	viper.SetDefault("disableRobotsTXT", false)
-	viper.SetDefault("contentDir", "content")
-	viper.SetDefault("layoutDir", "layouts")
-	viper.SetDefault("staticDir", "static")
-	viper.SetDefault("archetypeDir", "archetypes")
-	viper.SetDefault("publishDir", "public")
-	viper.SetDefault("dataDir", "data")
-	viper.SetDefault("i18nDir", "i18n")
-	viper.SetDefault("themesDir", "themes")
-	viper.SetDefault("defaultLayout", "post")
-	viper.SetDefault("buildDrafts", false)
-	viper.SetDefault("buildFuture", false)
-	viper.SetDefault("buildExpired", false)
-	viper.SetDefault("uglyURLs", false)
-	viper.SetDefault("verbose", false)
-	viper.SetDefault("ignoreCache", false)
-	viper.SetDefault("canonifyURLs", false)
-	viper.SetDefault("relativeURLs", false)
-	viper.SetDefault("removePathAccents", false)
-	viper.SetDefault("taxonomies", map[string]string{"tag": "tags", "category": "categories"})
-	viper.SetDefault("permalinks", make(PermalinkOverrides, 0))
-	viper.SetDefault("sitemap", Sitemap{Priority: -1, Filename: "sitemap.xml"})
-	viper.SetDefault("defaultExtension", "html")
-	viper.SetDefault("pygmentsStyle", "monokai")
-	viper.SetDefault("pygmentsUseClasses", false)
-	viper.SetDefault("pygmentsCodeFences", false)
-	viper.SetDefault("pygmentsOptions", "")
-	viper.SetDefault("disableLiveReload", false)
-	viper.SetDefault("pluralizeListTitles", true)
-	viper.SetDefault("preserveTaxonomyNames", false)
-	viper.SetDefault("forceSyncStatic", false)
-	viper.SetDefault("footnoteAnchorPrefix", "")
-	viper.SetDefault("footnoteReturnLinkContents", "")
-	viper.SetDefault("newContentEditor", "")
-	viper.SetDefault("paginate", 10)
-	viper.SetDefault("paginatePath", "page")
-	viper.SetDefault("blackfriday", helpers.NewBlackfriday(viper.GetViper()))
-	viper.SetDefault("rSSUri", "index.xml")
-	viper.SetDefault("sectionPagesMenu", "")
-	viper.SetDefault("disablePathToLower", false)
-	viper.SetDefault("hasCJKLanguage", false)
-	viper.SetDefault("enableEmoji", false)
-	viper.SetDefault("pygmentsCodeFencesGuessSyntax", false)
-	viper.SetDefault("useModTimeAsFallback", false)
-	viper.SetDefault("currentContentLanguage", helpers.NewDefaultLanguage())
-	viper.SetDefault("defaultContentLanguage", "en")
-	viper.SetDefault("defaultContentLanguageInSubdir", false)
-	viper.SetDefault("enableMissingTranslationPlaceholders", false)
-	viper.SetDefault("enableGitInfo", false)
+// ExampleConfig returns the some example configuration for documentation.
+func ExampleConfig() (*allconfig.Config, error) {
+	// Apply some example settings for the settings that does not come with a sensible default.
+	configToml := `
+title = 'My Blog'
+baseURL = "https://example.com/"
+disableKinds = ["term", "taxonomy"]
+
+[outputs]
+home = ['html', 'html', 'rss']
+page = ['html']
+
+[imaging]
+bgcolor = '#ffffff'
+hint = 'photo'
+quality = 81
+resamplefilter = 'CatmullRom'
+[imaging.exif]
+disableDate = true
+disableLatLong = true
+excludeFields = 'ColorSpace|Metering'
+
+[params]
+color = 'blue'
+style = 'dark'
+
+
+[languages]
+[languages.ar]
+languagedirection = 'rtl'
+title = 'مدونتي'
+weight = 2
+[languages.en]
+weight = 1
+[languages.fr]
+weight = 2
+[languages.fr.params]
+linkedin = 'https://linkedin.com/fr/whoever'
+color = 'green'
+[[languages.fr.menus.main]]
+name = 'Des produits'
+pageRef = '/products'
+weight = 20
+
+[menus]
+[[menus.main]]
+name = 'Home'
+pageRef = '/'
+weight = 10
+[[menus.main]]
+name = 'Products'
+pageRef = '/products'
+weight = 20
+[[menus.main]]
+name = 'Services'
+pageRef = '/services'
+weight = 30
+
+[deployment]
+order = [".jpg$", ".gif$"]
+[[deployment.targets]]
+name = "mydeployment"
+url = "s3://mybucket?region=us-east-1"
+cloudFrontDistributionID = "mydistributionid"
+[[deployment.matchers]]
+pattern = "^.+\\.(js|css|svg|ttf)$"
+cacheControl = "max-age=31536000, no-transform, public"
+gzip = true
+[[deployment.matchers]]
+pattern = "^.+\\.(png|jpg)$"
+cacheControl = "max-age=31536000, no-transform, public"
+gzip = false
+[[deployment.matchers]]
+pattern = "^sitemap\\.xml$"
+contentType = "application/xml"
+gzip = true
+[[deployment.matchers]]
+pattern = "^.+\\.(html|xml|json)$"
+gzip = true
+
+[permalinks]
+posts = '/posts/:year/:month/:title/'
+
+[taxonomies]
+category = 'categories'
+series = 'series'
+tag = 'tags'
+
+[module]
+[module.hugoVersion]
+min = '0.80.0'
+[[module.imports]]
+path = "github.com/bep/hugo-mod-misc/dummy-content"
+ignoreconfig = true
+ignoreimports = true
+[[module.mounts]]
+source = "content/blog"
+target = "content"
+
+[minify]
+[minify.tdewolff]
+[minify.tdewolff.json]
+precision = 2
+
+[[cascade]]
+background = 'yosemite.jpg'
+[cascade.target]
+  kind = 'page'
+  path = '/blog/**'
+[[cascade]]
+background = 'goldenbridge.jpg'
+[cascade.target]
+  kind = 'section'
+
+
+`
+
+	goMod := `
+module github.com/bep/mymod
+`
+
+	cfg := config.New()
+
+	tempDir := os.TempDir()
+	cacheDir := filepath.Join(tempDir, "hugocache")
+	if err := os.MkdirAll(cacheDir, 0o777); err != nil {
+		return nil, err
+	}
+	cfg.Set("cacheDir", cacheDir)
+	cfg.Set("workingDir", tempDir)
+	defer func() {
+		os.RemoveAll(tempDir)
+	}()
+
+	fs := afero.NewOsFs()
+
+	if err := afero.WriteFile(fs, filepath.Join(tempDir, "hugo.toml"), []byte(configToml), 0o644); err != nil {
+		return nil, err
+	}
+
+	if err := afero.WriteFile(fs, filepath.Join(tempDir, "go.mod"), []byte(goMod), 0o644); err != nil {
+		return nil, err
+	}
+
+	conf, err := allconfig.LoadConfig(allconfig.ConfigSourceDescriptor{Fs: fs, Flags: cfg, Environ: []string{"none"}})
+	if err != nil {
+		return nil, err
+	}
+	return conf.Base, err
 }

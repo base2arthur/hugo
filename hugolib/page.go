@@ -1,4 +1,4 @@
-// Copyright 2016 The Hugo Authors. All rights reserved.
+// Copyright 2024 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,1161 +14,971 @@
 package hugolib
 
 import (
-	"bytes"
-	"errors"
+	"context"
 	"fmt"
-	"reflect"
-
-	"github.com/bep/gitmap"
-
-	"github.com/mitchellh/mapstructure"
-	"github.com/spf13/hugo/helpers"
-	"github.com/spf13/hugo/parser"
-
-	"html/template"
-	"io"
-	"net/url"
-	"path"
+	"iter"
 	"path/filepath"
-	"regexp"
+	"reflect"
+	"slices"
 	"strings"
-	"sync"
-	"time"
-	"unicode/utf8"
+	"sync/atomic"
 
-	"github.com/spf13/cast"
-	bp "github.com/spf13/hugo/bufferpool"
-	"github.com/spf13/hugo/hugofs"
-	"github.com/spf13/hugo/source"
-	"github.com/spf13/hugo/tpl"
-	jww "github.com/spf13/jwalterweatherman"
-	"github.com/spf13/viper"
+	"github.com/gohugoio/hugo/hugofs"
+	"github.com/gohugoio/hugo/hugolib/segments"
+	"github.com/gohugoio/hugo/hugolib/sitesmatrix"
+	"github.com/gohugoio/hugo/identity"
+	"github.com/gohugoio/hugo/media"
+	"github.com/gohugoio/hugo/output"
+	"github.com/gohugoio/hugo/related"
+	"github.com/gohugoio/hugo/resources"
+	"github.com/gohugoio/hugo/tpl/tplimpl"
+	"github.com/spf13/afero"
+
+	"github.com/gohugoio/hugo/markup/converter"
+	"github.com/gohugoio/hugo/markup/tableofcontents"
+
+	"github.com/gohugoio/hugo/common/herrors"
+	"github.com/gohugoio/hugo/common/hreflect"
+	"github.com/gohugoio/hugo/common/types"
+
+	"github.com/gohugoio/hugo/source"
+
+	"github.com/gohugoio/hugo/common/collections"
+	"github.com/gohugoio/hugo/common/text"
+	"github.com/gohugoio/hugo/resources/kinds"
+	"github.com/gohugoio/hugo/resources/page"
+	"github.com/gohugoio/hugo/resources/resource"
 )
 
 var (
-	cjk = regexp.MustCompile(`\p{Han}|\p{Hangul}|\p{Hiragana}|\p{Katakana}`)
+	_ page.Page                                = (*pageState)(nil)
+	_ collections.Grouper                      = (*pageState)(nil)
+	_ collections.Slicer                       = (*pageState)(nil)
+	_ identity.DependencyManagerScopedProvider = (*pageState)(nil)
+	_ pageContext                              = (*pageState)(nil)
 )
 
-type Page struct {
-	Params            map[string]interface{}
-	Content           template.HTML
-	Summary           template.HTML
-	Aliases           []string
-	Status            string
-	Images            []Image
-	Videos            []Video
-	TableOfContents   template.HTML
-	Truncated         bool
-	Draft             bool
-	PublishDate       time.Time
-	ExpiryDate        time.Time
-	Markup            string
-	translations      Pages
-	extension         string
-	contentType       string
-	renderable        bool
-	Layout            string
-	layoutsCalculated []string
-	linkTitle         string
-	frontmatter       []byte
+var (
+	pageTypesProvider = resource.NewResourceTypesProvider(media.Builtin.OctetType, pageResourceType)
+	nopPageOutput     = &pageOutput{
+		pagePerOutputProviders: nopPagePerOutput,
+		MarkupProvider:         page.NopPage,
+		ContentProvider:        page.NopPage,
+	}
+)
 
-	// rawContent isn't "raw" as in the same as in the content file.
-	// Hugo cares about memory consumption, so we make changes to it to do
-	// markdown rendering etc., but it is "raw enough" so we can do rebuilds
-	// when shortcode changes etc.
-	rawContent []byte
-
-	// state telling if this is a "new page" or if we have rendered it previously.
-	rendered bool
-
-	contentShortCodes   map[string]func() (string, error)
-	shortcodes          map[string]shortcode
-	plain               string // TODO should be []byte
-	plainWords          []string
-	plainInit           sync.Once
-	plainWordsInit      sync.Once
-	renderingConfig     *helpers.Blackfriday
-	renderingConfigInit sync.Once
-	pageMenus           PageMenus
-	pageMenusInit       sync.Once
-	isCJKLanguage       bool
-	PageMeta
-	Source
-	Position `json:"-"`
-	Node
-
-	GitInfo *gitmap.GitInfo
+// pageContext provides contextual information about this page, for error
+// logging and similar.
+type pageContext interface {
+	posOffset(offset int) text.Position
+	wrapError(err error) error
+	getContentConverter() converter.Converter
 }
 
-type Source struct {
-	Frontmatter []byte
-	Content     []byte
-	source.File
-}
-type PageMeta struct {
-	wordCount      int
-	fuzzyWordCount int
-	readingTime    int
-	pageMetaInit   sync.Once
-	Weight         int
+type pageSiteAdapter struct {
+	p page.Page
+	s *Site
 }
 
-func (*PageMeta) WordCount() int {
-	helpers.Deprecated("PageMeta", "WordCount", ".WordCount (on Page)")
-	return 0
+func (pa pageSiteAdapter) GetPage(ref string) (page.Page, error) {
+	p, err := pa.s.getPage(pa.p, ref)
+
+	if p == nil {
+		// The nil struct has meaning in some situations, mostly to avoid breaking
+		// existing sites doing $nilpage.IsDescendant($p), which will always return
+		// false.
+		p = page.NilPage
+	}
+	return p, err
 }
 
-func (*PageMeta) FuzzyWordCount() int {
-	helpers.Deprecated("PageMeta", "FuzzyWordCount", ".FuzzyWordCount (on Page)")
-	return 0
+type pageState struct {
+	// Incremented for each new page created.
+	// Note that this will change between builds for a given Page.
+	pid uint64
 
+	s *Site
+
+	// This slice will be of same length as the number of global slice of output
+	// formats (for all sites).
+	pageOutputs []*pageOutput
+
+	// Used to determine if we can reuse content across output formats.
+	pageOutputTemplateVariationsState atomic.Uint32
+
+	// This will be shifted out when we start to render a new output format.
+	pageOutputIdx int
+	*pageOutput
+
+	// Common for all output formats.
+	*pageCommon
+
+	resource.Staler
+	dependencyManager identity.Manager
 }
 
-func (*PageMeta) ReadingTime() int {
-	helpers.Deprecated("PageMeta", "ReadingTime", ".ReadingTime (on Page)")
-	return 0
-}
-
-type Position struct {
-	Prev          *Page
-	Next          *Page
-	PrevInSection *Page
-	NextInSection *Page
-}
-
-type Pages []*Page
-
-func (ps Pages) FindPagePosByFilePath(inPath string) int {
-	for i, x := range ps {
-		if x.Source.Path() == inPath {
-			return i
+// This is not accurate and only used for progress reporting.
+// We can do better, but this will do for now.
+func (p *pageState) hasRenderableOutput() bool {
+	for _, po := range p.pageOutputs {
+		if po.render {
+			return true
 		}
 	}
-	return -1
-}
-
-// FindPagePos Given a page, it will find the position in Pages
-// will return -1 if not found
-func (ps Pages) FindPagePos(page *Page) int {
-	for i, x := range ps {
-		if x.Source.Path() == page.Source.Path() {
-			return i
-		}
-	}
-	return -1
-}
-
-func (p *Page) Plain() string {
-	p.initPlain()
-	return p.plain
-}
-
-func (p *Page) PlainWords() []string {
-	p.initPlainWords()
-	return p.plainWords
-}
-
-func (p *Page) initPlain() {
-	p.plainInit.Do(func() {
-		p.plain = helpers.StripHTML(string(p.Content))
-		return
-	})
-}
-
-func (p *Page) initPlainWords() {
-	p.plainWordsInit.Do(func() {
-		p.plainWords = strings.Fields(p.Plain())
-		return
-	})
-}
-
-func (p *Page) IsNode() bool {
 	return false
 }
 
-func (p *Page) IsPage() bool {
-	return true
+func (p *pageState) incrPageOutputTemplateVariation() {
+	p.pageOutputTemplateVariationsState.Add(1)
+}
+
+func (ps *pageState) canReusePageOutputContent() bool {
+	return ps.pageOutputTemplateVariationsState.Load() == 1
+}
+
+func (ps *pageState) IdentifierBase() string {
+	return ps.Path()
+}
+
+func (ps *pageState) GetIdentity() identity.Identity {
+	return ps
+}
+
+func (ps *pageState) ForEeachIdentity(f func(identity.Identity) bool) bool {
+	return f(ps)
+}
+
+func (ps *pageState) GetDependencyManager() identity.Manager {
+	return ps.dependencyManager
+}
+
+func (ps *pageState) GetDependencyManagerForScope(scope int) identity.Manager {
+	switch scope {
+	case pageDependencyScopeDefault:
+		return ps.dependencyManagerOutput
+	case pageDependencyScopeGlobal:
+		return ps.dependencyManager
+	default:
+		return identity.NopManager
+	}
+}
+
+func (ps *pageState) GetDependencyManagerForScopesAll() []identity.Manager {
+	return []identity.Manager{ps.dependencyManager, ps.dependencyManagerOutput}
 }
 
 // Param is a convenience method to do lookups in Page's and Site's Params map,
 // in that order.
 //
-// This method is also implemented on Node and SiteInfo.
-func (p *Page) Param(key interface{}) (interface{}, error) {
-	keyStr, err := cast.ToStringE(key)
-	if err != nil {
-		return nil, err
-	}
-	keyStr = strings.ToLower(keyStr)
-	if val, ok := p.Params[keyStr]; ok {
-		return val, nil
-	}
-	return p.Site.Params[keyStr], nil
-}
-
-func (p *Page) Author() Author {
-	authors := p.Authors()
-
-	for _, author := range authors {
-		return author
-	}
-	return Author{}
-}
-
-func (p *Page) Authors() AuthorList {
-	authorKeys, ok := p.Params["authors"]
-	if !ok {
-		return AuthorList{}
-	}
-	authors := authorKeys.([]string)
-	if len(authors) < 1 || len(p.Site.Authors) < 1 {
-		return AuthorList{}
-	}
-
-	al := make(AuthorList)
-	for _, author := range authors {
-		a, ok := p.Site.Authors[author]
-		if ok {
-			al[author] = a
+// This method is also implemented on SiteInfo.
+func (ps *pageState) Param(key any) (any, error) {
+	if keyStr, ok := key.(string); ok {
+		if method, ok := page.ReservedParamMethod(ps, keyStr); ok {
+			keyStr = strings.ToLower(keyStr)
+			if _, loaded := ps.s.h.pageParamDeprecations.LoadOrStore(keyStr, true); !loaded {
+				page.DeprecateReservedParam(ps.s.Log.Logger(), fmt.Sprintf(".Param %q", keyStr), keyStr, "."+method)
+			}
+			return hreflect.CallMethodByName(context.Background(), method, reflect.ValueOf(ps))[0].Interface(), nil
 		}
 	}
-	return al
+	return resource.Param(ps, ps.s.Params(), key)
 }
 
-func (p *Page) UniqueID() string {
-	return p.Source.UniqueID()
-}
-
-func (p *Page) Ref(ref string) (string, error) {
-	return p.Node.Site.Ref(ref, p)
-}
-
-func (p *Page) RelRef(ref string) (string, error) {
-	return p.Node.Site.RelRef(ref, p)
-}
-
-// for logging
-func (p *Page) lineNumRawContentStart() int {
-	return bytes.Count(p.frontmatter, []byte("\n")) + 1
-}
-
-var (
-	internalSummaryDivider = []byte("HUGOMORE42")
-)
-
-// Returns the page as summary and main if a user defined split is provided.
-func (p *Page) setUserDefinedSummaryIfProvided(rawContentCopy []byte) (*summaryContent, error) {
-
-	sc, err := splitUserDefinedSummaryAndContent(p.Markup, rawContentCopy)
-
-	if err != nil {
+// RelatedKeywords implements the related.Document interface needed for fast page searches.
+func (ps *pageState) RelatedKeywords(cfg related.IndexConfig) ([]string, error) {
+	v, found, err := page.NamedPageMetaValue(ps, cfg.Name)
+	if err != nil || !found {
 		return nil, err
 	}
 
-	if sc == nil {
-		// No divider found
-		return nil, nil
-	}
-
-	p.Truncated = true
-	if len(sc.content) < 20 {
-		// only whitespace?
-		p.Truncated = len(bytes.Trim(sc.content, " \n\r")) > 0
-	}
-
-	p.Summary = helpers.BytesToHTML(sc.summary)
-
-	return sc, nil
+	return cfg.ToKeywords(v)
 }
 
-// Make this explicit so there is no doubt about what is what.
-type summaryContent struct {
-	summary               []byte
-	content               []byte
-	contentWithoutSummary []byte
+func (ps *pageState) resetBuildState() {
+	ps.m.prepareRebuild()
 }
 
-func splitUserDefinedSummaryAndContent(markup string, c []byte) (sc *summaryContent, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("summary split failed: %s", r)
+func (ps *pageState) skipRender() bool {
+	b := ps.s.conf.Segments.Config.SegmentFilter.ShouldExcludeFine(
+		segments.SegmentQuery{
+			Path:   ps.Path(),
+			Kind:   ps.Kind(),
+			Site:   ps.s.siteVector,
+			Output: ps.pageOutput.f.Name,
+		},
+	)
+
+	return b
+}
+
+func (ps *pageState) isRenderedAny() bool {
+	for _, o := range ps.pageOutputs {
+		if o.isRendered() {
+			return true
 		}
-	}()
-
-	c = bytes.TrimSpace(c)
-	startDivider := bytes.Index(c, internalSummaryDivider)
-
-	if startDivider == -1 {
-		return
 	}
-
-	endDivider := startDivider + len(internalSummaryDivider)
-	endSummary := startDivider
-
-	var (
-		startMarkup []byte
-		endMarkup   []byte
-		addDiv      bool
-		divStart    = []byte("<div class=\"document\">")
-	)
-
-	switch markup {
-	default:
-		startMarkup = []byte("<p>")
-		endMarkup = []byte("</p>")
-	case "asciidoc":
-		startMarkup = []byte("<div class=\"paragraph\">")
-		endMarkup = []byte("</div>")
-	case "rst":
-		startMarkup = []byte("<p>")
-		endMarkup = []byte("</p>")
-		addDiv = true
-	}
-
-	// Find the closest end/start markup string to the divider
-	fromStart := -1
-	fromIdx := bytes.LastIndex(c[:startDivider], startMarkup)
-	if fromIdx != -1 {
-		fromStart = startDivider - fromIdx - len(startMarkup)
-	}
-	fromEnd := bytes.Index(c[endDivider:], endMarkup)
-
-	if fromEnd != -1 && fromEnd <= fromStart {
-		endSummary = startDivider + fromEnd + len(endMarkup)
-	} else if fromStart != -1 && fromEnd != -1 {
-		endSummary = startDivider - fromStart - len(startMarkup)
-	}
-
-	withoutDivider := bytes.TrimSpace(append(c[:startDivider], c[endDivider:]...))
-	var (
-		contentWithoutSummary []byte
-		summary               []byte
-	)
-
-	if len(withoutDivider) > 0 {
-		contentWithoutSummary = bytes.TrimSpace(withoutDivider[endSummary:])
-		summary = bytes.TrimSpace(withoutDivider[:endSummary])
-	}
-
-	if addDiv {
-		// For the rst
-		summary = append(append([]byte(nil), summary...), []byte("</div>")...)
-		// TODO(bep) include the document class, maybe
-		contentWithoutSummary = append(divStart, contentWithoutSummary...)
-	}
-
-	if err != nil {
-		return
-	}
-
-	sc = &summaryContent{
-		summary:               summary,
-		content:               withoutDivider,
-		contentWithoutSummary: contentWithoutSummary,
-	}
-
-	return
+	return false
 }
 
-func (p *Page) setAutoSummary() error {
-	var summary string
-	var truncated bool
-	if p.isCJKLanguage {
-		summary, truncated = helpers.TruncateWordsByRune(p.PlainWords(), helpers.SummaryLength)
-	} else {
-		summary, truncated = helpers.TruncateWordsToWholeSentence(p.Plain(), helpers.SummaryLength)
-	}
-	p.Summary = template.HTML(summary)
-	p.Truncated = truncated
+// Implements contentNode.
 
+func (ps *pageState) forEeachContentNode(f func(v sitesmatrix.Vector, n contentNode) bool) bool {
+	return f(ps.s.siteVector, ps)
+}
+
+func (ps *pageState) contentWeight() int {
+	return ps.m.pageMetaSource.contentWeight()
+}
+
+func (ps *pageState) nodeSourceEntryID() any {
+	return ps.m.nodeSourceEntryID()
+}
+
+func (ps *pageState) nodeCategoryPage() {
+	// Marker method.
+}
+
+func (m *pageState) nodeCategorySingle() {
+	// Marker method.
+}
+
+func (ps *pageState) lookupContentNode(v sitesmatrix.Vector) contentNode {
+	pc := ps.m.pageConfigSource
+	if pc.MatchSiteVector(v) {
+		return ps
+	}
 	return nil
 }
 
-func (p *Page) renderContent(content []byte) []byte {
-	var fn helpers.LinkResolverFunc
-	var fileFn helpers.FileResolverFunc
-	if p.getRenderingConfig().SourceRelativeLinksEval {
-		fn = func(ref string) (string, error) {
-			return p.Node.Site.SourceRelativeLink(ref, p)
+func (ps *pageState) lookupContentNodes(vec sitesmatrix.Vector, fallback bool) iter.Seq[contentNodeForSite] {
+	nop := func(yield func(n contentNodeForSite) bool) {}
+	pc := ps.m.pageConfigSource
+	if !fallback {
+		if !pc.MatchSiteVector(vec) {
+			return nop
 		}
-		fileFn = func(ref string) (string, error) {
-			return p.Node.Site.SourceRelativeLinkFile(ref, p)
+		return func(yield func(n contentNodeForSite) bool) {
+			yield(ps)
 		}
 	}
-	return helpers.RenderBytes(&helpers.RenderingContext{
-		Content: content, RenderTOC: true, PageFmt: p.determineMarkupType(),
-		ConfigProvider: p.Language(),
-		DocumentID:     p.UniqueID(), DocumentName: p.Path(),
-		Config: p.getRenderingConfig(), LinkResolver: fn, FileResolver: fileFn})
-}
 
-func (p *Page) getRenderingConfig() *helpers.Blackfriday {
-
-	p.renderingConfigInit.Do(func() {
-		pageParam := cast.ToStringMap(p.GetParam("blackfriday"))
-		if p.Language() == nil {
-			panic(fmt.Sprintf("nil language for %s with source lang %s", p.BaseFileName(), p.lang))
-		}
-		p.renderingConfig = helpers.NewBlackfriday(p.Language())
-
-		if err := mapstructure.Decode(pageParam, p.renderingConfig); err != nil {
-			jww.FATAL.Printf("Failed to get rendering config for %s:\n%s", p.BaseFileName(), err.Error())
-		}
-
-	})
-
-	return p.renderingConfig
-}
-
-func newPage(filename string) *Page {
-	page := Page{contentType: "",
-		Source:       Source{File: *source.NewFile(filename)},
-		Node:         Node{Keywords: []string{}, Sitemap: Sitemap{Priority: -1}},
-		Params:       make(map[string]interface{}),
-		translations: make(Pages, 0),
+	if !pc.MatchLanguageCoarse(vec) {
+		return nop
 	}
 
-	jww.DEBUG.Println("Reading from", page.File.Path())
-	return &page
+	if !pc.MatchVersionCoarse(vec) {
+		return nop
+	}
+	if !pc.MatchRoleCoarse(vec) {
+		return nop
+	}
+
+	return func(yield func(n contentNodeForSite) bool) {
+		yield(ps)
+	}
 }
 
-func (p *Page) IsRenderable() bool {
-	return p.renderable
-}
-
-func (p *Page) Type() string {
-	if p.contentType != "" {
-		return p.contentType
-	}
-
-	if x := p.Section(); x != "" {
-		return x
-	}
-
-	return "page"
-}
-
-func (p *Page) Section() string {
-	return p.Source.Section()
-}
-
-func (p *Page) layouts(l ...string) []string {
-	if len(p.layoutsCalculated) > 0 {
-		return p.layoutsCalculated
-	}
-
-	if p.Layout != "" {
-		return layouts(p.Type(), p.Layout)
-	}
-
-	layout := ""
-	if len(l) == 0 {
-		layout = "single"
-	} else {
-		layout = l[0]
-	}
-
-	return layouts(p.Type(), layout)
-}
-
-func layouts(types string, layout string) (layouts []string) {
-	t := strings.Split(types, "/")
-
-	// Add type/layout.html
-	for i := range t {
-		search := t[:len(t)-i]
-		layouts = append(layouts, fmt.Sprintf("%s/%s.html", strings.ToLower(path.Join(search...)), layout))
-	}
-
-	// Add _default/layout.html
-	layouts = append(layouts, fmt.Sprintf("_default/%s.html", layout))
-
-	// Add theme/type/layout.html & theme/_default/layout.html
-	for _, l := range layouts {
-		layouts = append(layouts, "theme/"+l)
-	}
-
-	return
-}
-
-func NewPageFrom(buf io.Reader, name string) (*Page, error) {
-	p, err := NewPage(name)
+// Eq returns whether the current page equals the given page.
+// This is what's invoked when doing `{{ if eq $page $otherPage }}`
+func (ps *pageState) Eq(other any) bool {
+	pp, err := unwrapPage(other)
 	if err != nil {
-		return p, err
-	}
-	_, err = p.ReadFrom(buf)
-
-	return p, err
-}
-
-func NewPage(name string) (*Page, error) {
-	if len(name) == 0 {
-		return nil, errors.New("Zero length page name")
+		return false
 	}
 
-	// Create new page
-	p := newPage(name)
-
-	return p, nil
+	return ps == pp
 }
 
-func (p *Page) ReadFrom(buf io.Reader) (int64, error) {
-	// Parse for metadata & body
-	if err := p.parse(buf); err != nil {
-		jww.ERROR.Print(err)
-		return 0, err
+func (ps *pageState) HeadingsFiltered(context.Context) tableofcontents.Headings {
+	return nil
+}
+
+type pageHeadingsFiltered struct {
+	*pageState
+	headings tableofcontents.Headings
+}
+
+func (p *pageHeadingsFiltered) HeadingsFiltered(context.Context) tableofcontents.Headings {
+	return p.headings
+}
+
+func (p *pageHeadingsFiltered) page() page.Page {
+	return p.pageState
+}
+
+// For internal use by the related content feature.
+func (ps *pageState) ApplyFilterToHeadings(ctx context.Context, fn func(*tableofcontents.Heading) bool) related.Document {
+	fragments := ps.pageOutput.pco.c().Fragments(ctx)
+	headings := fragments.Headings.FilterBy(fn)
+	return &pageHeadingsFiltered{
+		pageState: ps,
+		headings:  headings,
 	}
-
-	return int64(len(p.rawContent)), nil
 }
 
-func (p *Page) WordCount() int {
-	p.analyzePage()
-	return p.wordCount
+func (ps *pageState) GitInfo() *source.GitInfo {
+	return ps.gitInfo
 }
 
-func (p *Page) ReadingTime() int {
-	p.analyzePage()
-	return p.readingTime
+func (ps *pageState) CodeOwners() []string {
+	return ps.codeowners
 }
 
-func (p *Page) FuzzyWordCount() int {
-	p.analyzePage()
-	return p.fuzzyWordCount
+// GetTerms gets the terms defined on this page in the given taxonomy.
+// The pages returned will be ordered according to the front matter.
+func (ps *pageState) GetTerms(taxonomy string) page.Pages {
+	return ps.s.pageMap.getTermsForPageInTaxonomy(ps.Path(), taxonomy)
 }
 
-func (p *Page) analyzePage() {
-	p.pageMetaInit.Do(func() {
-		if p.isCJKLanguage {
-			p.wordCount = 0
-			for _, word := range p.PlainWords() {
-				runeCount := utf8.RuneCountInString(word)
-				if len(word) == runeCount {
-					p.wordCount++
-				} else {
-					p.wordCount += runeCount
-				}
-			}
-		} else {
-			p.wordCount = helpers.TotalWords(p.Plain())
-		}
-
-		// TODO(bep) is set in a test. Fix that.
-		if p.fuzzyWordCount == 0 {
-			p.fuzzyWordCount = (p.wordCount + 100) / 100 * 100
-		}
-
-		if p.isCJKLanguage {
-			p.readingTime = (p.wordCount + 500) / 501
-		} else {
-			p.readingTime = (p.wordCount + 212) / 213
-		}
-	})
+func (ps *pageState) MarshalJSON() ([]byte, error) {
+	return page.MarshalPageToJSON(ps)
 }
 
-func (p *Page) permalink() (*url.URL, error) {
-	baseURL := string(p.Site.BaseURL)
-	dir := strings.TrimSpace(p.Site.pathSpec.MakePath(filepath.ToSlash(strings.ToLower(p.Source.Dir()))))
-	pSlug := strings.TrimSpace(p.Site.pathSpec.URLize(p.Slug))
-	pURL := strings.TrimSpace(p.Site.pathSpec.URLize(p.URLPath.URL))
-	var permalink string
-	var err error
-
-	if len(pURL) > 0 {
-		return helpers.MakePermalink(baseURL, pURL), nil
+func (ps *pageState) RegularPagesRecursive() page.Pages {
+	switch ps.Kind() {
+	case kinds.KindSection, kinds.KindHome:
+		return ps.s.pageMap.getPagesInSection(
+			pageMapQueryPagesInSection{
+				Path:      ps.Path(),
+				Include:   pagePredicates.ShouldListLocal.And(pagePredicates.KindPage).BoolFunc(),
+				Recursive: true,
+			},
+		)
+	default:
+		return ps.RegularPages()
 	}
+}
 
-	if override, ok := p.Site.Permalinks[p.Section()]; ok {
-		permalink, err = override.Expand(p)
+func (ps *pageState) PagesRecursive() page.Pages {
+	return nil
+}
 
-		if err != nil {
-			return nil, err
+func (ps *pageState) RegularPages() page.Pages {
+	switch ps.Kind() {
+	case kinds.KindPage:
+	case kinds.KindSection, kinds.KindHome, kinds.KindTaxonomy:
+		return ps.s.pageMap.getPagesInSection(
+			pageMapQueryPagesInSection{
+				Path:    ps.Path(),
+				Include: pagePredicates.ShouldListLocal.And(pagePredicates.KindPage).BoolFunc(),
+			},
+		)
+	case kinds.KindTerm:
+		return ps.s.pageMap.getPagesWithTerm(
+			pageMapQueryPagesBelowPath{
+				Path:    ps.Path(),
+				Include: pagePredicates.ShouldListLocal.And(pagePredicates.KindPage).BoolFunc(),
+			},
+		)
+	default:
+		return ps.s.RegularPages()
+	}
+	return nil
+}
+
+func (ps *pageState) Pages() page.Pages {
+	switch ps.Kind() {
+	case kinds.KindPage:
+	case kinds.KindSection, kinds.KindHome:
+		return ps.s.pageMap.getPagesInSection(
+			pageMapQueryPagesInSection{
+				Path:    ps.Path(),
+				KeyPart: "page-section",
+				Include: pagePredicates.ShouldListLocal.And(
+					pagePredicates.KindPage.Or(pagePredicates.KindSection),
+				).BoolFunc(),
+			},
+		)
+	case kinds.KindTerm:
+		return ps.s.pageMap.getPagesWithTerm(
+			pageMapQueryPagesBelowPath{
+				Path: ps.Path(),
+			},
+		)
+	case kinds.KindTaxonomy:
+		return ps.s.pageMap.getPagesInSection(
+			pageMapQueryPagesInSection{
+				Path:      ps.Path(),
+				KeyPart:   "term",
+				Include:   pagePredicates.ShouldListLocal.And(pagePredicates.KindTerm).BoolFunc(),
+				Recursive: true,
+			},
+		)
+	default:
+		return ps.s.Pages()
+	}
+	return nil
+}
+
+// RawContent returns the un-rendered source content without
+// any leading front matter.
+func (ps *pageState) RawContent() string {
+	if ps.m.content.pi.itemsStep2 == nil {
+		return ""
+	}
+	start := ps.m.content.pi.posMainContent
+	if start == -1 {
+		start = 0
+	}
+	source, err := ps.m.content.pi.contentSource(ps.m.content)
+	if err != nil {
+		panic(err)
+	}
+	return string(source[start:])
+}
+
+func (ps *pageState) Resources() resource.Resources {
+	return ps.s.pageMap.getOrCreateResourcesForPage(ps)
+}
+
+func (ps *pageState) HasShortcode(name string) bool {
+	p := ps.m.content.hasShortcode.Load()
+	if p == nil {
+		return false
+	}
+	hasShortcode := *p
+	return hasShortcode(name)
+}
+
+func (ps *pageState) Site() page.Site {
+	return ps.s.siteWrapped
+}
+
+func (ps *pageState) String() string {
+	var sb strings.Builder
+	if ps.File() != nil {
+		// The forward slashes even on Windows is motivated by
+		// getting stable tests.
+		// This information is meant for getting positional information in logs,
+		// so the direction of the slashes should not matter.
+		sb.WriteString(filepath.ToSlash(ps.File().Filename()))
+		if ps.File().IsContentAdapter() {
+			// Also include the path.
+			sb.WriteString(":")
+			sb.WriteString(ps.Path())
 		}
 	} else {
-		if len(pSlug) > 0 {
-			permalink = helpers.URLPrep(viper.GetBool("uglyURLs"), path.Join(dir, p.Slug+"."+p.Extension()))
-		} else {
-			t := p.Source.TranslationBaseName()
-			permalink = helpers.URLPrep(viper.GetBool("uglyURLs"), path.Join(dir, (strings.TrimSpace(t)+"."+p.Extension())))
-		}
+		sb.WriteString(ps.Path())
 	}
-
-	permalink = p.addLangPathPrefix(permalink)
-
-	return helpers.MakePermalink(baseURL, permalink), nil
-}
-
-func (p *Page) Extension() string {
-	if p.extension != "" {
-		return p.extension
-	}
-	return viper.GetString("defaultExtension")
-}
-
-// AllTranslations returns all translations, including the current Page.
-func (p *Page) AllTranslations() Pages {
-	return p.translations
+	return sb.String()
 }
 
 // IsTranslated returns whether this content file is translated to
 // other language(s).
-func (p *Page) IsTranslated() bool {
-	return len(p.translations) > 1
+func (ps *pageState) IsTranslated() bool {
+	return len(ps.AllTranslations()) > 1
+}
+
+// TranslationKey returns the key used to identify a translation of this content.
+func (ps *pageState) TranslationKey() string {
+	if ps.m.pageConfig.TranslationKey != "" {
+		return ps.m.pageConfig.TranslationKey
+	}
+	return ps.Path()
+}
+
+// AllTranslations returns all translations, including the current Page.
+func (ps *pageState) AllTranslations() page.Pages {
+	key := ps.Path() + "/" + "translations-all"
+	// This is called from Translations, so we need to use a different partition, cachePages2,
+	// to avoid potential deadlocks.
+	pages, err := ps.s.pageMap.getOrCreatePagesFromCache(ps.s.pageMap.cachePages2, key, func(string) (page.Pages, error) {
+		if ps.m.pageConfig.TranslationKey != "" {
+			// translationKey set by user.
+			pas, _ := ps.s.h.translationKeyPages.Get(ps.m.pageConfig.TranslationKey)
+			pasc := slices.Clone(pas)
+			page.SortByLanguage(pasc)
+			return pasc, nil
+		}
+		var pas page.Pages
+
+		ps.s.pageMap.treePages.ForEeachInDimension(ps.Path(), ps.s.siteVector, sitesmatrix.Language,
+			func(n contentNode) bool {
+				if n != nil {
+					pas = append(pas, n.(page.Page))
+				}
+				return true
+			},
+		)
+
+		pas = pagePredicates.ShouldLink.Filter(pas)
+		page.SortByLanguage(pas)
+		return pas, nil
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	return pages
+}
+
+// For internal use only.
+func (ps *pageState) SiteVector() sitesmatrix.Vector {
+	return ps.s.siteVector
+}
+
+func (ps *pageState) siteVector() sitesmatrix.Vector {
+	return ps.s.siteVector
+}
+
+func (ps *pageState) siteVectors() sitesmatrix.VectorIterator {
+	return ps.s.siteVector
+}
+
+// Rotate returns all pages in the given dimension for this page.
+func (ps *pageState) Rotate(dimensionStr string) (page.Pages, error) {
+	dimensionStr = strings.ToLower(dimensionStr)
+	key := ps.Path() + "/" + "rotate-" + dimensionStr
+	d, err := sitesmatrix.ParseDimension(dimensionStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse dimension %q: %w", dimensionStr, err)
+	}
+
+	pages, err := ps.s.pageMap.getOrCreatePagesFromCache(ps.s.pageMap.cachePages2, key, func(string) (page.Pages, error) {
+		var pas page.Pages
+		ps.s.pageMap.treePages.ForEeachInDimension(ps.Path(), ps.s.siteVector, d,
+			func(n contentNode) bool {
+				if n != nil {
+					p := n.(page.Page)
+					pas = append(pas, p)
+				}
+				return true
+			},
+		)
+
+		if dimensionStr == "language" && ps.m.pageConfig.TranslationKey != "" {
+			// translationKey set by user.
+			// This is an old construct back from when languages were introduced.
+			// We keep it for backward compatibility.
+			// Also see AllTranslations.
+			pas, _ := ps.s.h.translationKeyPages.Get(ps.m.pageConfig.TranslationKey)
+			pasc := slices.Clone(pas)
+			page.SortByLanguage(pasc)
+			return pasc, nil
+		}
+
+		pas = pagePredicates.ShouldLink.Filter(pas)
+		page.SortByDims(pas)
+		return pas, nil
+	})
+
+	return pages, err
 }
 
 // Translations returns the translations excluding the current Page.
-func (p *Page) Translations() Pages {
-	translations := make(Pages, 0)
-	for _, t := range p.translations {
-		if t != p {
-			translations = append(translations, t)
+func (ps *pageState) Translations() page.Pages {
+	key := ps.Path() + "/" + "translations"
+	pages, err := ps.s.pageMap.getOrCreatePagesFromCache(nil, key, func(string) (page.Pages, error) {
+		var pas page.Pages
+		for _, pp := range ps.AllTranslations() {
+			if !pp.Eq(ps) {
+				pas = append(pas, pp)
+			}
 		}
-	}
-	return translations
-}
-
-func (p *Page) LinkTitle() string {
-	if len(p.linkTitle) > 0 {
-		return p.linkTitle
-	}
-	return p.Title
-}
-
-func (p *Page) shouldBuild() bool {
-	return shouldBuild(viper.GetBool("buildFuture"), viper.GetBool("buildExpired"),
-		viper.GetBool("buildDrafts"), p.Draft, p.PublishDate, p.ExpiryDate)
-}
-
-func shouldBuild(buildFuture bool, buildExpired bool, buildDrafts bool, Draft bool,
-	publishDate time.Time, expiryDate time.Time) bool {
-	if !(buildDrafts || !Draft) {
-		return false
-	}
-	if !buildFuture && !publishDate.IsZero() && publishDate.After(time.Now()) {
-		return false
-	}
-	if !buildExpired && !expiryDate.IsZero() && expiryDate.Before(time.Now()) {
-		return false
-	}
-	return true
-}
-
-func (p *Page) IsDraft() bool {
-	return p.Draft
-}
-
-func (p *Page) IsFuture() bool {
-	if p.PublishDate.IsZero() {
-		return false
-	}
-	return p.PublishDate.After(time.Now())
-}
-
-func (p *Page) IsExpired() bool {
-	if p.ExpiryDate.IsZero() {
-		return false
-	}
-	return p.ExpiryDate.Before(time.Now())
-}
-
-func (p *Page) Permalink() (string, error) {
-	link, err := p.permalink()
+		return pas, nil
+	})
 	if err != nil {
-		return "", err
+		panic(err)
 	}
-	return link.String(), nil
+	return pages
 }
 
-func (p *Page) URL() string {
-	if p.URLPath.URL != "" {
-		// This is the url set in front matter
-		return p.URLPath.URL
+func (ps *pageState) initCommonProviders(pp pagePaths) error {
+	if ps.IsPage() {
+		if ps.s == nil {
+			panic("no site")
+		}
+		ps.posNextPrev = &nextPrev{init: ps.s.init.prevNext}
+		ps.posNextPrevSection = &nextPrev{init: ps.s.init.prevNextInSection}
+		ps.InSectionPositioner = newPagePositionInSection(ps.posNextPrevSection)
+		ps.Positioner = newPagePosition(ps.posNextPrev)
 	}
-	// Fall back to the relative permalink.
-	u, _ := p.RelPermalink()
-	return u
+
+	ps.OutputFormatsProvider = pp
+	ps.targetPathDescriptor = pp.targetPathDescriptor
+	ps.RefProvider = newPageRef(ps)
+	ps.SitesProvider = ps.s
+	ps.SiteProvider = ps
+
+	return nil
 }
 
-func (p *Page) RelPermalink() (string, error) {
-	link, err := p.permalink()
-	if err != nil {
-		return "", err
-	}
+// Exported so it can be used in integration tests.
+func (po *pageOutput) GetInternalTemplateBasePathAndDescriptor() (string, tplimpl.TemplateDescriptor) {
+	p := po.p
+	f := po.f
 
-	if viper.GetBool("canonifyURLs") {
-		// replacements for relpermalink with baseURL on the form http://myhost.com/sub/ will fail later on
-		// have to return the URL relative from baseURL
-		relpath, err := helpers.GetRelativePath(link.String(), string(p.Site.BaseURL))
-		if err != nil {
-			return "", err
-		}
-		return "/" + filepath.ToSlash(relpath), nil
+	base := p.PathInfo().BaseReTyped(p.m.pageConfig.Type)
+	return base, tplimpl.TemplateDescriptor{
+		Kind:           p.Kind(),
+		LayoutFromUser: p.Layout(),
+		OutputFormat:   f.Name,
+		MediaType:      f.MediaType.Type,
+		IsPlainText:    f.IsPlainText,
 	}
-
-	link.Scheme = ""
-	link.Host = ""
-	link.User = nil
-	link.Opaque = ""
-	return link.String(), nil
 }
 
-var ErrHasDraftAndPublished = errors.New("both draft and published parameters were found in page's frontmatter")
+func (ps *pageState) resolveTemplate(layouts ...string) (*tplimpl.TemplInfo, bool, error) {
+	pth, d := ps.GetInternalTemplateBasePathAndDescriptor()
+	var subPath string
 
-func (p *Page) update(f interface{}) error {
-	if f == nil {
-		return fmt.Errorf("no metadata found")
-	}
-	m := f.(map[string]interface{})
-	var err error
-	var draft, published, isCJKLanguage *bool
-	for k, v := range m {
-		loki := strings.ToLower(k)
-		switch loki {
-		case "title":
-			p.Title = cast.ToString(v)
-		case "linktitle":
-			p.linkTitle = cast.ToString(v)
-		case "description":
-			p.Description = cast.ToString(v)
-			p.Params["description"] = p.Description
-		case "slug":
-			p.Slug = cast.ToString(v)
-		case "url":
-			if url := cast.ToString(v); strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
-				return fmt.Errorf("Only relative URLs are supported, %v provided", url)
-			}
-			p.URLPath.URL = cast.ToString(v)
-		case "type":
-			p.contentType = cast.ToString(v)
-		case "extension", "ext":
-			p.extension = cast.ToString(v)
-		case "keywords":
-			p.Keywords = cast.ToStringSlice(v)
-		case "date":
-			p.Date, err = cast.ToTimeE(v)
-			if err != nil {
-				jww.ERROR.Printf("Failed to parse date '%v' in page %s", v, p.File.Path())
-			}
-		case "lastmod":
-			p.Lastmod, err = cast.ToTimeE(v)
-			if err != nil {
-				jww.ERROR.Printf("Failed to parse lastmod '%v' in page %s", v, p.File.Path())
-			}
-		case "publishdate", "pubdate":
-			p.PublishDate, err = cast.ToTimeE(v)
-			if err != nil {
-				jww.ERROR.Printf("Failed to parse publishdate '%v' in page %s", v, p.File.Path())
-			}
-		case "expirydate", "unpublishdate":
-			p.ExpiryDate, err = cast.ToTimeE(v)
-			if err != nil {
-				jww.ERROR.Printf("Failed to parse expirydate '%v' in page %s", v, p.File.Path())
-			}
-		case "draft":
-			draft = new(bool)
-			*draft = cast.ToBool(v)
-		case "published": // Intentionally undocumented
-			published = new(bool)
-			*published = cast.ToBool(v)
-		case "layout":
-			p.Layout = cast.ToString(v)
-		case "markup":
-			p.Markup = cast.ToString(v)
-		case "weight":
-			p.Weight = cast.ToInt(v)
-		case "aliases":
-			p.Aliases = cast.ToStringSlice(v)
-			for _, alias := range p.Aliases {
-				if strings.HasPrefix(alias, "http://") || strings.HasPrefix(alias, "https://") {
-					return fmt.Errorf("Only relative aliases are supported, %v provided", alias)
-				}
-			}
-		case "status":
-			p.Status = cast.ToString(v)
-		case "sitemap":
-			p.Sitemap = parseSitemap(cast.ToStringMap(v))
-		case "iscjklanguage":
-			isCJKLanguage = new(bool)
-			*isCJKLanguage = cast.ToBool(v)
-		default:
-			// If not one of the explicit values, store in Params
-			switch vv := v.(type) {
-			case bool:
-				p.Params[loki] = vv
-			case string:
-				p.Params[loki] = vv
-			case int64, int32, int16, int8, int:
-				p.Params[loki] = vv
-			case float64, float32:
-				p.Params[loki] = vv
-			case time.Time:
-				p.Params[loki] = vv
-			default: // handle array of strings as well
-				switch vvv := vv.(type) {
-				case []interface{}:
-					if len(vvv) > 0 {
-						switch vvv[0].(type) {
-						case map[interface{}]interface{}: // Proper parsing structured array from YAML based FrontMatter
-							p.Params[loki] = vvv
-						case map[string]interface{}: // Proper parsing structured array from JSON based FrontMatter
-							p.Params[loki] = vvv
-						default:
-							a := make([]string, len(vvv))
-							for i, u := range vvv {
-								a[i] = cast.ToString(u)
-							}
-
-							p.Params[loki] = a
-						}
-					} else {
-						p.Params[loki] = []string{}
-					}
-				default:
-					p.Params[loki] = vv
-				}
+	if len(layouts) > 0 {
+		layout := layouts[0]
+		if i := strings.LastIndexByte(layout, '/'); i != -1 {
+			// A layout in a sub path, e.g. "foo/mylayout".
+			subPath, layout = layout[:i], layout[i+1:]
+			if layout == "" {
+				return nil, false, nil
 			}
 		}
+		d.LayoutFromUser = layout
+		d.LayoutFromUserMustMatch = true
 	}
 
-	if draft != nil && published != nil {
-		p.Draft = *draft
-		jww.ERROR.Printf("page %s has both draft and published settings in its frontmatter. Using draft.", p.File.Path())
-		return ErrHasDraftAndPublished
-	} else if draft != nil {
-		p.Draft = *draft
-	} else if published != nil {
-		p.Draft = !*published
+	q := tplimpl.TemplateQuery{
+		Path:     pth,
+		SubPath:  subPath,
+		Category: tplimpl.CategoryLayout,
+		Sites:    ps.s.siteVector,
+		Desc:     d,
 	}
 
-	if p.Date.IsZero() && viper.GetBool("useModTimeAsFallback") {
-		fi, err := hugofs.Source().Stat(filepath.Join(helpers.AbsPathify(viper.GetString("contentDir")), p.File.Path()))
-		if err == nil {
-			p.Date = fi.ModTime()
+	tinfo := ps.s.TemplateStore.LookupPagesLayout(q)
+	if tinfo == nil {
+		return nil, false, nil
+	}
+
+	return tinfo, true, nil
+}
+
+// Must be run after the site section tree etc. is built and ready.
+func (ps *pageState) initPage() error {
+	var initErr error
+	ps.pageInit.Do(func() {
+		var pp pagePaths
+		pp, initErr = newPagePaths(ps)
+		if initErr != nil {
+			return
 		}
-	}
 
-	if p.Lastmod.IsZero() {
-		p.Lastmod = p.Date
-	}
+		var outputFormatsForPage output.Formats
+		var renderFormats output.Formats
 
-	if isCJKLanguage != nil {
-		p.isCJKLanguage = *isCJKLanguage
-	} else if viper.GetBool("hasCJKLanguage") {
-		if cjk.Match(p.rawContent) {
-			p.isCJKLanguage = true
+		if ps.m.standaloneOutputFormat.IsZero() {
+			outputFormatsForPage = ps.outputFormats()
+			renderFormats = ps.s.h.renderFormats
 		} else {
-			p.isCJKLanguage = false
+			// One of the fixed output format pages, e.g. 404.
+			outputFormatsForPage = output.Formats{ps.m.standaloneOutputFormat}
+			renderFormats = outputFormatsForPage
 		}
-	}
 
-	return nil
+		// Prepare output formats for all sites.
+		// We do this even if this page does not get rendered on
+		// its own. It may be referenced via one of the site collections etc.
+		// it will then need an output format.
+		ps.pageOutputs = make([]*pageOutput, len(renderFormats))
+		created := make(map[string]*pageOutput)
+		shouldRenderPage := !ps.m.noRender()
 
-}
+		for i, f := range renderFormats {
 
-func (p *Page) GetParam(key string) interface{} {
-	return p.getParam(key, true)
-}
+			if po, found := created[f.Name]; found {
+				ps.pageOutputs[i] = po
+				continue
+			}
 
-func (p *Page) getParam(key string, stringToLower bool) interface{} {
-	v := p.Params[strings.ToLower(key)]
+			render := shouldRenderPage
+			if render {
+				_, render = outputFormatsForPage.GetByName(f.Name)
+			}
 
-	if v == nil {
-		return nil
-	}
+			po := newPageOutput(ps, pp, f, render)
 
-	switch val := v.(type) {
-	case bool:
-		return val
-	case string:
-		if stringToLower {
-			return strings.ToLower(val)
+			// Create a content provider for the first,
+			// we may be able to reuse it.
+			if i == 0 {
+				var contentProvider *pageContentOutput
+				contentProvider, initErr = newPageContentOutput(po)
+				if initErr != nil {
+					return
+				}
+				po.setContentProvider(contentProvider)
+			}
+
+			ps.pageOutputs[i] = po
+			created[f.Name] = po
+
 		}
-		return val
-	case int64, int32, int16, int8, int:
-		return cast.ToInt(v)
-	case float64, float32:
-		return cast.ToFloat64(v)
-	case time.Time:
-		return val
-	case []string:
-		if stringToLower {
-			return helpers.SliceToLower(val)
-		}
-		return v
-	case map[string]interface{}: // JSON and TOML
-		return v
-	case map[interface{}]interface{}: // YAML
-		return v
-	}
 
-	jww.ERROR.Printf("GetParam(\"%s\"): Unknown type %s\n", key, reflect.TypeOf(v))
-	return nil
-}
-
-func (p *Page) HasMenuCurrent(menu string, me *MenuEntry) bool {
-	menus := p.Menus()
-	sectionPagesMenu := helpers.Config().GetString("SectionPagesMenu")
-
-	// page is labeled as "shadow-member" of the menu with the same identifier as the section
-	if sectionPagesMenu != "" && p.Section() != "" && sectionPagesMenu == menu && p.Section() == me.Identifier {
-		return true
-	}
-
-	if m, ok := menus[menu]; ok {
-		if me.HasChildren() {
-			for _, child := range me.Children {
-				if child.IsEqual(m) {
-					return true
-				}
-				if p.HasMenuCurrent(menu, child) {
-					return true
-				}
-			}
-		}
-	}
-
-	return false
-
-}
-
-func (p *Page) IsMenuCurrent(menu string, inme *MenuEntry) bool {
-	menus := p.Menus()
-
-	if me, ok := menus[menu]; ok {
-		return me.IsEqual(inme)
-	}
-
-	return false
-}
-
-func (p *Page) Menus() PageMenus {
-	p.pageMenusInit.Do(func() {
-		p.pageMenus = PageMenus{}
-
-		if ms, ok := p.Params["menu"]; ok {
-			link, _ := p.RelPermalink()
-
-			me := MenuEntry{Name: p.LinkTitle(), Weight: p.Weight, URL: link}
-
-			// Could be the name of the menu to attach it to
-			mname, err := cast.ToStringE(ms)
-
-			if err == nil {
-				me.Menu = mname
-				p.pageMenus[mname] = &me
-				return
-			}
-
-			// Could be a slice of strings
-			mnames, err := cast.ToStringSliceE(ms)
-
-			if err == nil {
-				for _, mname := range mnames {
-					me.Menu = mname
-					p.pageMenus[mname] = &me
-				}
-				return
-			}
-
-			// Could be a structured menu entry
-			menus, err := cast.ToStringMapE(ms)
-
-			if err != nil {
-				jww.ERROR.Printf("unable to process menus for %q\n", p.Title)
-			}
-
-			for name, menu := range menus {
-				menuEntry := MenuEntry{Name: p.LinkTitle(), URL: link, Weight: p.Weight, Menu: name}
-				if menu != nil {
-					jww.DEBUG.Printf("found menu: %q, in %q\n", name, p.Title)
-					ime, err := cast.ToStringMapE(menu)
-					if err != nil {
-						jww.ERROR.Printf("unable to process menus for %q: %s", p.Title, err)
-					}
-
-					menuEntry.marshallMap(ime)
-				}
-				p.pageMenus[name] = &menuEntry
-
-			}
+		if initErr = ps.initCommonProviders(pp); initErr != nil {
+			return
 		}
 	})
 
-	return p.pageMenus
+	return initErr
 }
 
-func (p *Page) Render(layout ...string) template.HTML {
-	var l []string
+func (ps *pageState) renderResources() error {
+	for _, r := range ps.Resources() {
+		if _, ok := r.(page.Page); ok {
+			if !ps.s.h.BuildState.IsRebuild() {
+				// Pages gets rendered with the owning page but we count them here.
+				ps.s.PathSpec.ProcessingStats.Incr(&ps.s.PathSpec.ProcessingStats.Pages)
+			}
+			continue
+		}
 
-	if len(layout) > 0 {
-		l = layouts(p.Type(), layout[0])
-	} else {
-		l = p.layouts()
+		if resources.IsPublished(r) {
+			continue
+		}
+
+		src, ok := r.(resource.Source)
+		if !ok {
+			return fmt.Errorf("resource %T does not support resource.Source", r)
+		}
+
+		if err := src.Publish(); err != nil {
+			if !herrors.IsNotExist(err) {
+				ps.s.Log.Errorf("Failed to publish Resource for page %q: %s", ps.pathOrTitle(), err)
+			}
+		} else {
+			ps.s.PathSpec.ProcessingStats.Incr(&ps.s.PathSpec.ProcessingStats.Files)
+		}
 	}
 
-	return tpl.ExecuteTemplateToHTML(p, l...)
+	return nil
 }
 
-func (p *Page) determineMarkupType() string {
-	// Try markup explicitly set in the frontmatter
-	p.Markup = helpers.GuessType(p.Markup)
-	if p.Markup == "unknown" {
-		// Fall back to file extension (might also return "unknown")
-		p.Markup = helpers.GuessType(p.Source.Ext())
+func (ps *pageState) AlternativeOutputFormats() page.OutputFormats {
+	f := ps.outputFormat()
+	var o page.OutputFormats
+	for _, of := range ps.OutputFormats() {
+		if of.Format.NotAlternative || of.Format.Name == f.Name {
+			continue
+		}
+
+		o = append(o, of)
+	}
+	return o
+}
+
+type renderStringOpts struct {
+	Display string
+	Markup  string
+}
+
+var defaultRenderStringOpts = renderStringOpts{
+	Display: "inline",
+	Markup:  "", // Will inherit the page's value when not set.
+}
+
+func (m *pageMetaSource) wrapError(err error, sourceFs afero.Fs) error {
+	if err == nil {
+		panic("wrapError with nil")
 	}
 
-	return p.Markup
+	if m.f == nil {
+		// No more details to add.
+		return fmt.Errorf("%q: %w", m.Path(), err)
+	}
+
+	return hugofs.AddFileInfoToError(err, m.f.FileInfo(), sourceFs)
 }
 
-func (p *Page) parse(reader io.Reader) error {
-	psr, err := parser.ReadFrom(reader)
+// wrapError adds some more context to the given error if possible/needed
+func (ps *pageState) wrapError(err error) error {
+	return ps.m.wrapError(err, ps.s.h.SourceFs)
+}
+
+func (ps *pageState) getPageInfoForError() string {
+	s := fmt.Sprintf("kind: %q, path: %q", ps.Kind(), ps.Path())
+	if ps.File() != nil {
+		s += fmt.Sprintf(", file: %q", ps.File().Filename())
+	}
+	return s
+}
+
+func (ps *pageState) getContentConverter() converter.Converter {
+	var err error
+	ps.contentConverterInit.Do(func() {
+		if ps.m.pageConfigSource.ContentMediaType.IsZero() {
+			panic("ContentMediaType not set")
+		}
+		markup := ps.m.pageConfigSource.ContentMediaType.SubType
+
+		if markup == "html" {
+			// Only reachable for shortcode inner content rendering; file-based
+			// HTML pages are gated at initFrontMatter via security.allowContent.
+			markup = "markdown"
+		}
+		ps.contentConverter, err = ps.m.newContentConverter(ps, markup)
+	})
+
 	if err != nil {
+		ps.s.Log.Errorln("Failed to create content converter:", err)
+	}
+	return ps.contentConverter
+}
+
+func (ps *pageState) errorf(err error, format string, a ...any) error {
+	if herrors.UnwrapFileError(err) != nil {
+		// More isn't always better.
+		return err
+	}
+	args := append([]any{ps.Language().Lang, ps.pathOrTitle()}, a...)
+	args = append(args, err)
+	format = "[%s] page %q: " + format + ": %w"
+	if err == nil {
+		return fmt.Errorf(format, args...)
+	}
+	return fmt.Errorf(format, args...)
+}
+
+func (ps *pageState) outputFormat() (f output.Format) {
+	if ps.pageOutput == nil {
+		panic("no pageOutput")
+	}
+	return ps.pageOutput.f
+}
+
+func (ps *pageState) parseError(err error, input []byte, offset int) error {
+	pos := posFromInput("", input, offset)
+	return herrors.NewFileErrorFromName(err, ps.File().Filename()).UpdatePosition(pos)
+}
+
+func (ps *pageState) pathOrTitle() string {
+	if ps.File() != nil {
+		return ps.File().Filename()
+	}
+
+	if ps.Path() != "" {
+		return ps.Path()
+	}
+
+	return ps.Title()
+}
+
+func (ps *pageState) posFromInput(input []byte, offset int) text.Position {
+	return posFromInput(ps.pathOrTitle(), input, offset)
+}
+
+func (ps *pageState) posOffset(offset int) text.Position {
+	return ps.posFromInput(ps.m.content.mustSource(), offset)
+}
+
+// shiftToOutputFormat is serialized. The output format idx refers to the
+// full set of output formats for all sites.
+// This is serialized.
+func (ps *pageState) shiftToOutputFormat(isRenderingSite bool, idx int) error {
+	if err := ps.initPage(); err != nil {
 		return err
 	}
 
-	p.renderable = psr.IsRenderable()
-	p.frontmatter = psr.FrontMatter()
-	p.rawContent = psr.Content()
-	p.lang = p.Source.File.Lang()
-
-	meta, err := psr.Metadata()
-	if meta != nil {
-		if err != nil {
-			jww.ERROR.Printf("Error parsing page meta data for %s", p.File.Path())
-			jww.ERROR.Println(err)
-			return err
-		}
-		if err = p.update(meta); err != nil {
-			return err
-		}
+	if len(ps.pageOutputs) == 1 {
+		idx = 0
 	}
 
-	return nil
-}
+	ps.pageOutputIdx = idx
+	ps.pageOutput = ps.pageOutputs[idx]
+	if ps.pageOutput == nil {
+		panic(fmt.Sprintf("pageOutput is nil for output idx %d", idx))
+	}
 
-func (p *Page) RawContent() string {
-	return string(p.rawContent)
-}
+	// Reset any built paginator. This will trigger when re-rendering pages in
+	// server mode.
+	if isRenderingSite && ps.pageOutput.paginator != nil && ps.pageOutput.paginator.current != nil {
+		ps.pageOutput.paginator.reset()
+	}
 
-func (p *Page) SetSourceContent(content []byte) {
-	p.Source.Content = content
-}
+	if isRenderingSite {
+		cp := ps.pageOutput.pco
+		if cp == nil && ps.canReusePageOutputContent() {
+			// Look for content to reuse.
+			for i := range ps.pageOutputs {
+				if i == idx {
+					continue
+				}
+				po := ps.pageOutputs[i]
 
-func (p *Page) SetSourceMetaData(in interface{}, mark rune) (err error) {
-	// See https://github.com/spf13/hugo/issues/2458
-	defer func() {
-		if r := recover(); r != nil {
-			var ok bool
-			err, ok = r.(error)
-			if !ok {
-				err = fmt.Errorf("error from marshal: %v", r)
+				if po.pco != nil {
+					cp = po.pco
+					break
+				}
 			}
 		}
-	}()
 
-	var by []byte
-
-	by, err = parser.InterfaceToFrontMatter(in, mark)
-	if err != nil {
-		return
-	}
-	by = append(by, '\n')
-
-	p.Source.Frontmatter = by
-
-	return
-}
-
-func (p *Page) SafeSaveSourceAs(path string) error {
-	return p.saveSourceAs(path, true)
-}
-
-func (p *Page) SaveSourceAs(path string) error {
-	return p.saveSourceAs(path, false)
-}
-
-func (p *Page) saveSourceAs(path string, safe bool) error {
-	b := bp.GetBuffer()
-	defer bp.PutBuffer(b)
-
-	b.Write(p.Source.Frontmatter)
-	b.Write(p.Source.Content)
-
-	bc := make([]byte, b.Len(), b.Len())
-	copy(bc, b.Bytes())
-
-	err := p.saveSource(bc, path, safe)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func (p *Page) saveSource(by []byte, inpath string, safe bool) (err error) {
-	if !filepath.IsAbs(inpath) {
-		inpath = helpers.AbsPathify(inpath)
-	}
-	jww.INFO.Println("creating", inpath)
-
-	if safe {
-		err = helpers.SafeWriteToDisk(inpath, bytes.NewReader(by), hugofs.Source())
-	} else {
-		err = helpers.WriteToDisk(inpath, bytes.NewReader(by), hugofs.Source())
-	}
-	if err != nil {
-		return
-	}
-	return nil
-}
-
-func (p *Page) SaveSource() error {
-	return p.SaveSourceAs(p.FullFilePath())
-}
-
-func (p *Page) ProcessShortcodes(t tpl.Template) {
-	tmpContent, tmpContentShortCodes, _ := extractAndRenderShortcodes(string(p.rawContent), p, t)
-	p.rawContent = []byte(tmpContent)
-	p.contentShortCodes = tmpContentShortCodes
-}
-
-func (p *Page) FullFilePath() string {
-	return filepath.Join(p.Dir(), p.LogicalName())
-}
-
-func (p *Page) TargetPath() (outfile string) {
-	// Always use URL if it's specified
-	if len(strings.TrimSpace(p.URLPath.URL)) > 2 {
-		outfile = strings.TrimSpace(p.URLPath.URL)
-
-		if strings.HasSuffix(outfile, "/") {
-			outfile = outfile + "index.html"
-		}
-		outfile = filepath.FromSlash(outfile)
-		return
-	}
-
-	// If there's a Permalink specification, we use that
-	if override, ok := p.Site.Permalinks[p.Section()]; ok {
-		var err error
-		outfile, err = override.Expand(p)
-		if err == nil {
-			outfile, _ = url.QueryUnescape(outfile)
-			if strings.HasSuffix(outfile, "/") {
-				outfile += "index.html"
+		if cp == nil {
+			var err error
+			cp, err = newPageContentOutput(ps.pageOutput)
+			if err != nil {
+				return err
 			}
-			outfile = filepath.FromSlash(outfile)
-			outfile = p.addLangFilepathPrefix(outfile)
-			return
+		}
+		ps.pageOutput.setContentProvider(cp)
+	} else {
+		// We attempt to assign pageContentOutputs while preparing each site
+		// for rendering and before rendering each site. This lets us share
+		// content between page outputs to conserve resources. But if a template
+		// unexpectedly calls a method of a ContentProvider that is not yet
+		// initialized, we assign a LazyContentProvider that performs the
+		// initialization just in time.
+		if lcp, ok := (ps.pageOutput.ContentProvider.(*page.LazyContentProvider)); ok {
+			lcp.Reset()
+		} else {
+			lcp = page.NewLazyContentProvider(func(context.Context) page.OutputFormatContentProvider {
+				cp, err := newPageContentOutput(ps.pageOutput)
+				if err != nil {
+					panic(err)
+				}
+				return cp
+			})
+
+			ps.pageOutput.contentRenderer = lcp
+			ps.pageOutput.ContentProvider = lcp
+			ps.pageOutput.MarkupProvider = lcp
+			ps.pageOutput.PageRenderProvider = lcp
+			ps.pageOutput.TableOfContentsProvider = lcp
 		}
 	}
 
-	if len(strings.TrimSpace(p.Slug)) > 0 {
-		outfile = strings.TrimSpace(p.Slug) + "." + p.Extension()
-	} else {
-		// Fall back to filename
-		outfile = (p.Source.TranslationBaseName() + "." + p.Extension())
-	}
+	return nil
+}
 
-	return p.addLangFilepathPrefix(filepath.Join(strings.ToLower(
-		p.Site.pathSpec.MakePath(p.Source.Dir())), strings.TrimSpace(outfile)))
+var (
+	_ page.Page         = (*pageWithOrdinal)(nil)
+	_ collections.Order = (*pageWithOrdinal)(nil)
+	_ pageWrapper       = (*pageWithOrdinal)(nil)
+)
+
+type pageWithOrdinal struct {
+	ordinal int
+	*pageState
+}
+
+func (p pageWithOrdinal) Ordinal() int {
+	return p.ordinal
+}
+
+func (p pageWithOrdinal) page() page.Page {
+	return p.pageState
+}
+
+type pageWithWeight0 struct {
+	weight0 int
+	*pageState
+}
+
+func (p pageWithWeight0) Weight0() int {
+	return p.weight0
+}
+
+func (p pageWithWeight0) page() page.Page {
+	return p.pageState
+}
+
+var _ types.Unwrapper = (*pageWithWeight0)(nil)
+
+func (p pageWithWeight0) Unwrapv() any {
+	return p.pageState
 }

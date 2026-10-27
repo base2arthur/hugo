@@ -1,6 +1,6 @@
-+++
-weight = 5
-[menu]
-  [menu.main]
-    parent = "x"
-+++
+---
+title: {{ replace .File.ContentBaseName "-" " " | strings.FirstUpper }}
+description:
+categories: []
+keywords: []
+---

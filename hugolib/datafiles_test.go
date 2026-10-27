@@ -1,4 +1,4 @@
-// Copyright 2015 The Hugo Authors. All rights reserved.
+// Copyright 2019 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,117 +14,71 @@
 package hugolib
 
 import (
-	"path/filepath"
-	"reflect"
-	"strings"
 	"testing"
-
-	"github.com/spf13/hugo/parser"
-	"github.com/spf13/hugo/source"
-	"github.com/stretchr/testify/require"
 )
 
-func TestDataDirJSON(t *testing.T) {
-	sources := []source.ByteSource{
-		{Name: filepath.FromSlash("test/foo.json"), Content: []byte(`{ "bar": "foofoo"  }`)},
-		{Name: filepath.FromSlash("test.json"), Content: []byte(`{ "hello": [ { "world": "foo" } ] }`)},
-	}
+func TestData(t *testing.T) {
+	t.Run("with theme", func(t *testing.T) {
+		t.Parallel()
 
-	expected, err := parser.HandleJSONMetaData([]byte(`{ "test": { "hello": [{ "world": "foo"  }] , "foo": { "bar":"foofoo" } } }`))
+		files := `
+-- hugo.toml --
+baseURL = "https://example.com"
+disableKinds = ["taxonomy", "term", "RSS", "sitemap", "robotsTXT", "page", "section"]
+theme = "mytheme"
+-- data/a.toml --
+v1 = "a_v1"
+-- data/b.yaml --
+v1: b_v1
+-- data/c/d.yaml --
+v1: c_d_v1
+-- themes/mytheme/data/a.toml --
+v1 = "a_v1_theme"
+-- themes/mytheme/data/d.toml --
+v1 = "d_v1_theme"
+-- layouts/home.html --
+a: {{ hugo.Data.a.v1 }}|
+b: {{ hugo.Data.b.v1 }}|
+cd: {{ hugo.Data.c.d.v1 }}|
+d: {{ hugo.Data.d.v1 }}|
+`
+		b := Test(t, files)
 
-	if err != nil {
-		t.Fatalf("Error %s", err)
-	}
-
-	doTestDataDir(t, expected, []source.Input{&source.InMemorySource{ByteSource: sources}})
+		b.AssertFileContent("public/index.html", "a: a_v1|\nb: b_v1|\ncd: c_d_v1|\nd: d_v1_theme|")
+	})
 }
 
-func TestDataDirToml(t *testing.T) {
-	sources := []source.ByteSource{
-		{Name: filepath.FromSlash("test/kung.toml"), Content: []byte("[foo]\nbar = 1")},
-	}
+func TestDataMixedCaseFolders(t *testing.T) {
+	t.Parallel()
 
-	expected, err := parser.HandleTOMLMetaData([]byte("[test]\n[test.kung]\n[test.kung.foo]\nbar = 1"))
+	files := `
+-- hugo.toml --
+baseURL = "https://example.com"
+-- data/MyFolder/MyData.toml --
+v1 = "my_v1"
+-- layouts/home.html --
+{{ hugo.Data }}
+v1: {{  hugo.Data.MyFolder.MyData.v1 }}|
+`
+	b := Test(t, files)
 
-	if err != nil {
-		t.Fatalf("Error %s", err)
-	}
-
-	doTestDataDir(t, expected, []source.Input{&source.InMemorySource{ByteSource: sources}})
+	b.AssertFileContent("public/index.html", "v1: my_v1|")
 }
 
-func TestDataDirYAMLWithOverridenValue(t *testing.T) {
-	sources := []source.ByteSource{
-		// filepath.Walk walks the files in lexical order, '/' comes before '.'. Simulate this:
-		{Name: filepath.FromSlash("a.yaml"), Content: []byte("a: 1")},
-		{Name: filepath.FromSlash("test/v1.yaml"), Content: []byte("v1-2: 2")},
-		{Name: filepath.FromSlash("test/v2.yaml"), Content: []byte("v2:\n- 2\n- 3")},
-		{Name: filepath.FromSlash("test.yaml"), Content: []byte("v1: 1")},
-	}
+// Issue #12133
+func TestDataNoAssets(t *testing.T) {
+	t.Parallel()
 
-	expected := map[string]interface{}{"a": map[string]interface{}{"a": 1},
-		"test": map[string]interface{}{"v1": map[string]interface{}{"v1-2": 2}, "v2": map[string]interface{}{"v2": []interface{}{2, 3}}}}
+	files := `
+-- hugo.toml --
+disableKinds = ['page','rss','section','sitemap','taxonomy','term']
+-- assets/data/foo.toml --
+content = "I am assets/data/foo.toml"
+-- layouts/home.html --
+|{{ hugo.Data.foo.content }}|
+	`
 
-	doTestDataDir(t, expected, []source.Input{&source.InMemorySource{ByteSource: sources}})
-}
+	b := Test(t, files)
 
-// issue 892
-func TestDataDirMultipleSources(t *testing.T) {
-	s1 := []source.ByteSource{
-		{Name: filepath.FromSlash("test/first.toml"), Content: []byte("bar = 1")},
-	}
-
-	s2 := []source.ByteSource{
-		{Name: filepath.FromSlash("test/first.toml"), Content: []byte("bar = 2")},
-		{Name: filepath.FromSlash("test/second.toml"), Content: []byte("tender = 2")},
-	}
-
-	expected, _ := parser.HandleTOMLMetaData([]byte("[test.first]\nbar = 1\n[test.second]\ntender=2"))
-
-	doTestDataDir(t, expected, []source.Input{&source.InMemorySource{ByteSource: s1}, &source.InMemorySource{ByteSource: s2}})
-
-}
-
-func TestDataDirUnknownFormat(t *testing.T) {
-	sources := []source.ByteSource{
-		{Name: filepath.FromSlash("test.roml"), Content: []byte("boo")},
-	}
-	s := newSiteDefaultLang()
-	err := s.loadData([]source.Input{&source.InMemorySource{ByteSource: sources}})
-	if err != nil {
-		t.Fatalf("Should not return an error")
-	}
-}
-
-func doTestDataDir(t *testing.T, expected interface{}, sources []source.Input) {
-	s := newSiteDefaultLang()
-	err := s.loadData(sources)
-	if err != nil {
-		t.Fatalf("Error loading data: %s", err)
-	}
-	if !reflect.DeepEqual(expected, s.Data) {
-		t.Errorf("Expected structure\n%#v got\n%#v", expected, s.Data)
-	}
-}
-
-func TestDataFromShortcode(t *testing.T) {
-	testCommonResetState()
-	writeSource(t, "data/hugo.toml", "slogan = \"Hugo Rocks!\"")
-	writeSource(t, "layouts/_default/single.html", `
-* Slogan from template: {{  .Site.Data.hugo.slogan }}
-* {{ .Content }}`)
-	writeSource(t, "layouts/shortcodes/d.html", `{{  .Page.Site.Data.hugo.slogan }}`)
-	writeSource(t, "content/c.md", `---
----
-Slogan from shortcode: {{< d >}}
-`)
-
-	h, err := newHugoSitesDefaultLanguage()
-	require.NoError(t, err)
-	require.NoError(t, h.Build(BuildCfg{}))
-
-	content := readSource(t, "public/c/index.html")
-	require.True(t, strings.Contains(content, "Slogan from template: Hugo Rocks!"), content)
-	require.True(t, strings.Contains(content, "Slogan from shortcode: Hugo Rocks!"), content)
-
+	b.AssertFileContent("public/index.html", "||")
 }

@@ -1,4 +1,4 @@
-// Copyright 2015 The Hugo Authors. All rights reserved.
+// Copyright 2024 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,147 +14,302 @@
 package commands
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 
-	"github.com/spf13/cast"
+	"github.com/bep/simplecobra"
+	"github.com/gohugoio/hugo/common/hugio"
+	"github.com/gohugoio/hugo/config"
+	"github.com/gohugoio/hugo/helpers"
+	"github.com/gohugoio/hugo/hugofs"
+	"github.com/gohugoio/hugo/hugolib"
+	"github.com/gohugoio/hugo/parser"
+	"github.com/gohugoio/hugo/parser/metadecoders"
+	"github.com/gohugoio/hugo/parser/pageparser"
+	"github.com/gohugoio/hugo/resources/page"
 	"github.com/spf13/cobra"
-	"github.com/spf13/hugo/helpers"
-	"github.com/spf13/hugo/hugolib"
-	"github.com/spf13/hugo/parser"
-	jww "github.com/spf13/jwalterweatherman"
-	"github.com/spf13/viper"
 )
 
-var outputDir string
-var unsafe bool
-
-var convertCmd = &cobra.Command{
-	Use:   "convert",
-	Short: "Convert your content to different formats",
-	Long: `Convert your content (e.g. front matter) to different formats.
-
-See convert's subcommands toJSON, toTOML and toYAML for more information.`,
-	RunE: nil,
-}
-
-var toJSONCmd = &cobra.Command{
-	Use:   "toJSON",
-	Short: "Convert front matter to JSON",
-	Long: `toJSON converts all front matter in the content directory
+func newConvertCommand() *convertCommand {
+	var c *convertCommand
+	c = &convertCommand{
+		commands: []simplecobra.Commander{
+			&simpleCommand{
+				name:  "toJSON",
+				short: "Convert front matter to JSON",
+				long: `toJSON converts all front matter in the content directory
 to use JSON for the front matter.`,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return convertContents(rune([]byte(parser.JSONLead)[0]))
-	},
-}
-
-var toTOMLCmd = &cobra.Command{
-	Use:   "toTOML",
-	Short: "Convert front matter to TOML",
-	Long: `toTOML converts all front matter in the content directory
+				run: func(ctx context.Context, cd *simplecobra.Commandeer, r *rootCommand, args []string) error {
+					return c.convertContents(metadecoders.JSON)
+				},
+				withc: func(cmd *cobra.Command, r *rootCommand) {
+					cmd.ValidArgsFunction = cobra.NoFileCompletions
+				},
+			},
+			&simpleCommand{
+				name:  "toTOML",
+				short: "Convert front matter to TOML",
+				long: `toTOML converts all front matter in the content directory
 to use TOML for the front matter.`,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return convertContents(rune([]byte(parser.TOMLLead)[0]))
-	},
-}
-
-var toYAMLCmd = &cobra.Command{
-	Use:   "toYAML",
-	Short: "Convert front matter to YAML",
-	Long: `toYAML converts all front matter in the content directory
+				run: func(ctx context.Context, cd *simplecobra.Commandeer, r *rootCommand, args []string) error {
+					return c.convertContents(metadecoders.TOML)
+				},
+				withc: func(cmd *cobra.Command, r *rootCommand) {
+					cmd.ValidArgsFunction = cobra.NoFileCompletions
+				},
+			},
+			&simpleCommand{
+				name:  "toYAML",
+				short: "Convert front matter to YAML",
+				long: `toYAML converts all front matter in the content directory
 to use YAML for the front matter.`,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return convertContents(rune([]byte(parser.YAMLLead)[0]))
-	},
-}
-
-func init() {
-	convertCmd.AddCommand(toJSONCmd)
-	convertCmd.AddCommand(toTOMLCmd)
-	convertCmd.AddCommand(toYAMLCmd)
-	convertCmd.PersistentFlags().StringVarP(&outputDir, "output", "o", "", "filesystem path to write files to")
-	convertCmd.PersistentFlags().StringVarP(&source, "source", "s", "", "filesystem path to read files relative from")
-	convertCmd.PersistentFlags().BoolVar(&unsafe, "unsafe", false, "enable less safe operations, please backup first")
-	convertCmd.PersistentFlags().SetAnnotation("source", cobra.BashCompSubdirsInDir, []string{})
-}
-
-func convertContents(mark rune) (err error) {
-	if err := InitializeConfig(); err != nil {
-		return err
+				run: func(ctx context.Context, cd *simplecobra.Commandeer, r *rootCommand, args []string) error {
+					return c.convertContents(metadecoders.YAML)
+				},
+				withc: func(cmd *cobra.Command, r *rootCommand) {
+					cmd.ValidArgsFunction = cobra.NoFileCompletions
+				},
+			},
+		},
 	}
+	return c
+}
 
-	h, err := hugolib.NewHugoSitesFromConfiguration()
+type convertCommand struct {
+	// Flags.
+	outputDir string
+	unsafe    bool
 
+	// Deps.
+	r *rootCommand
+	h *hugolib.HugoSites
+
+	// Commands.
+	commands []simplecobra.Commander
+}
+
+func (c *convertCommand) Commands() []simplecobra.Commander {
+	return c.commands
+}
+
+func (c *convertCommand) Name() string {
+	return "convert"
+}
+
+func (c *convertCommand) Run(ctx context.Context, cd *simplecobra.Commandeer, args []string) error {
+	return nil
+}
+
+func (c *convertCommand) Init(cd *simplecobra.Commandeer) error {
+	cmd := cd.CobraCommand
+	cmd.Short = "Convert front matter to another format"
+	cmd.Long = `Convert front matter to another format.
+
+See convert's subcommands toJSON, toTOML and toYAML for more information.`
+
+	cmd.PersistentFlags().StringVarP(&c.outputDir, "output", "o", "", "filesystem path to write files to")
+	_ = cmd.MarkFlagDirname("output")
+	cmd.PersistentFlags().BoolVar(&c.unsafe, "unsafe", false, "enable less safe operations, please backup first")
+
+	cmd.RunE = nil
+	return nil
+}
+
+func (c *convertCommand) PreRun(cd, runner *simplecobra.Commandeer) error {
+	c.r = cd.Root.Command.(*rootCommand)
+	cfg := config.New()
+	cfg.Set("buildDrafts", true)
+	h, err := c.r.Hugo(flagsToCfg(cd, cfg))
 	if err != nil {
 		return err
 	}
+	c.h = h
+	return nil
+}
 
-	site := h.Sites[0]
+func (c *convertCommand) convertAndSavePage(p page.Page, site *hugolib.Site, targetFormat metadecoders.Format) error {
+	// The resources are not in .Site.AllPages.
+	for _, r := range p.Resources().ByType("page") {
+		if err := c.convertAndSavePage(r.(page.Page), site, targetFormat); err != nil {
+			return err
+		}
+	}
 
-	if err = site.Initialise(); err != nil {
+	if p.File() == nil {
+		// No content file.
+		return nil
+	}
+
+	errMsg := fmt.Errorf("error processing file %q", p.File().Path())
+
+	site.Log.Infoln("attempting to convert", p.File().Filename())
+
+	f := p.File()
+	file, err := f.FileInfo().Meta().Open()
+	if err != nil {
+		site.Log.Errorln(errMsg)
+		file.Close()
+		return nil
+	}
+
+	pf, err := pageparser.ParseFrontMatterAndContent(file)
+	if err != nil {
+		site.Log.Errorln(errMsg)
+		file.Close()
 		return err
 	}
 
-	if site.Source == nil {
-		panic(fmt.Sprintf("site.Source not set"))
-	}
-	if len(site.Source.Files()) < 1 {
-		return fmt.Errorf("No source files found")
-	}
+	file.Close()
 
-	contentDir := helpers.AbsPathify(viper.GetString("contentDir"))
-	jww.FEEDBACK.Println("processing", len(site.Source.Files()), "content files")
-	for _, file := range site.Source.Files() {
-		jww.INFO.Println("Attempting to convert", file.LogicalName())
-		page, err := hugolib.NewPage(file.LogicalName())
-		if err != nil {
-			return err
-		}
-
-		psr, err := parser.ReadFrom(file.Contents)
-		if err != nil {
-			jww.ERROR.Println("Error processing file:", file.Path())
-			return err
-		}
-		metadata, err := psr.Metadata()
-		if err != nil {
-			jww.ERROR.Println("Error processing file:", file.Path())
-			return err
-		}
-
-		// better handling of dates in formats that don't have support for them
-		if mark == parser.FormatToLeadRune("json") || mark == parser.FormatToLeadRune("yaml") || mark == parser.FormatToLeadRune("toml") {
-			newmetadata := cast.ToStringMap(metadata)
-			for k, v := range newmetadata {
-				switch vv := v.(type) {
-				case time.Time:
-					newmetadata[k] = vv.Format(time.RFC3339)
-				}
+	// better handling of dates in formats that don't have support for them
+	if pf.FrontMatterFormat == metadecoders.JSON || pf.FrontMatterFormat == metadecoders.YAML || pf.FrontMatterFormat == metadecoders.TOML {
+		for k, v := range pf.FrontMatter {
+			switch vv := v.(type) {
+			case time.Time:
+				pf.FrontMatter[k] = vv.Format(time.RFC3339)
 			}
-			metadata = newmetadata
 		}
+	}
 
-		page.SetDir(filepath.Join(contentDir, file.Dir()))
-		page.SetSourceContent(psr.Content())
-		if err = page.SetSourceMetaData(metadata, mark); err != nil {
-			jww.ERROR.Printf("Failed to set source metadata for file %q: %s. For more info see For more info see https://github.com/spf13/hugo/issues/2458", page.FullFilePath(), err)
+	var newContent bytes.Buffer
+	err = parser.InterfaceToFrontMatter(pf.FrontMatter, targetFormat, &newContent)
+	if err != nil {
+		site.Log.Errorln(errMsg)
+		return err
+	}
+
+	newContent.Write(pf.Content)
+
+	newFilename := p.File().Filename()
+
+	if c.outputDir != "" {
+		contentDir := strings.TrimSuffix(newFilename, p.File().Path())
+		contentDir = filepath.Base(contentDir)
+
+		newFilename = filepath.Join(c.outputDir, contentDir, p.File().Path())
+	}
+
+	fs := hugofs.Os
+	if err := helpers.WriteToDisk(newFilename, &newContent, fs); err != nil {
+		return fmt.Errorf("failed to save file %q:: %w", newFilename, err)
+	}
+
+	return nil
+}
+
+func (c *convertCommand) copyContentDirsForOutput(pagesBackedByFile page.Pages) error {
+	contentDirs := make(map[string]bool)
+	for _, p := range pagesBackedByFile {
+		filename := p.File().Filename()
+		contentDir := strings.TrimSuffix(filename, p.File().Path())
+		if contentDir == filename {
 			continue
 		}
+		contentDirs[filepath.Clean(contentDir)] = true
+	}
 
-		if outputDir != "" {
-			if err = page.SaveSourceAs(filepath.Join(outputDir, page.FullFilePath())); err != nil {
-				return fmt.Errorf("Failed to save file %q: %s", page.FullFilePath(), err)
-			}
-		} else {
-			if unsafe {
-				if err = page.SaveSource(); err != nil {
-					return fmt.Errorf("Failed to save file %q: %s", page.FullFilePath(), err)
-				}
-			} else {
-				jww.FEEDBACK.Println("Unsafe operation not allowed, use --unsafe or set a different output path")
+	var contentDirList []string
+	for contentDir := range contentDirs {
+		contentDirList = append(contentDirList, contentDir)
+	}
+	slices.Sort(contentDirList)
+
+	outputDirAbs, err := filepath.Abs(c.outputDir)
+	if err != nil {
+		return fmt.Errorf("failed to resolve output path %q: %w", c.outputDir, err)
+	}
+
+	for _, contentDir := range contentDirList {
+		outputContentDirAbs := filepath.Join(outputDirAbs, filepath.Base(contentDir))
+
+		skipDirs := make(map[string]bool)
+		relToOutputDir, err := filepath.Rel(contentDir, outputDirAbs)
+		if err == nil && relToOutputDir != ".." && !strings.HasPrefix(relToOutputDir, ".."+string(filepath.Separator)) {
+			skipDirs[filepath.Clean(outputDirAbs)] = true
+		}
+		relToOutputContentDir, err := filepath.Rel(contentDir, outputContentDirAbs)
+		if err == nil && relToOutputContentDir != ".." && !strings.HasPrefix(relToOutputContentDir, ".."+string(filepath.Separator)) {
+			skipDirs[filepath.Clean(outputContentDirAbs)] = true
+		}
+
+		var shouldCopy func(filename string) bool
+		if len(skipDirs) > 0 {
+			shouldCopy = func(filename string) bool {
+				return !skipDirs[filepath.Clean(filename)]
 			}
 		}
+
+		if err := hugio.CopyDir(hugofs.Os, contentDir, outputContentDirAbs, shouldCopy); err != nil {
+			return fmt.Errorf("failed to copy %q to %q: %w", contentDir, outputContentDirAbs, err)
+		}
 	}
-	return
+
+	return nil
+}
+
+func (c *convertCommand) convertContents(format metadecoders.Format) error {
+	if c.outputDir == "" && !c.unsafe {
+		return newUserError("Unsafe operation not allowed, use --unsafe or set a different output path")
+	}
+
+	if err := c.h.Build(hugolib.BuildCfg{SkipRender: true}); err != nil {
+		return err
+	}
+
+	site := c.h.Sites[0]
+
+	workingDir := c.h.Sites[0].Deps.Conf.WorkingDir() + string(filepath.Separator)
+
+	isConvertible := func(p page.Page) bool {
+		// Skip pages not backed by a content file.
+		if p.File() == nil {
+			return false
+		}
+		// Skip content adapters.
+		if p.File().IsContentAdapter() {
+			return false
+		}
+		// Skip content files provided by modules, including vendored modules.
+		if !p.File().FileInfo().Meta().IsProject {
+			return false
+		}
+		// Skip content files in project mounts outside the working directory.
+		if !strings.HasPrefix(p.File().Filename(), workingDir) {
+			return false
+		}
+		return true
+	}
+
+	seen := make(map[string]bool)
+	var pagesBackedByFile page.Pages
+	for _, p := range c.h.Pages() {
+		if !isConvertible(p) {
+			continue
+		}
+		filename := p.File().Filename()
+		if seen[filename] {
+			continue
+		}
+		seen[filename] = true
+		pagesBackedByFile = append(pagesBackedByFile, p)
+	}
+
+	if c.outputDir != "" {
+		if err := c.copyContentDirsForOutput(pagesBackedByFile); err != nil {
+			return err
+		}
+	}
+
+	site.Log.Println("processing", len(pagesBackedByFile), "content files")
+	for _, p := range pagesBackedByFile {
+		if err := c.convertAndSavePage(p, site, format); err != nil {
+			return err
+		}
+	}
+	return nil
 }

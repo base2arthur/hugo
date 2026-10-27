@@ -1,4 +1,4 @@
-// Copyright 2016 The Hugo Authors. All rights reserved.
+// Copyright 2025 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,33 +14,96 @@
 package hugolib
 
 import (
-	"path/filepath"
 	"testing"
-
-	"github.com/spf13/viper"
 )
 
-func TestRSSOutput(t *testing.T) {
-	testCommonResetState()
+// Before Hugo 0.49 we set the pseudo page kind RSS on the page when output to RSS.
+// This had some unintended side effects, esp. when the only output format for that page
+// was RSS.
+// For the page kinds that can have multiple output formats, the Kind should be one of the
+// standard home, page etc.
+// This test has this single purpose: Check that the Kind is that of the source page.
+// See https://github.com/gohugoio/hugo/issues/5138
+func TestRSSKind(t *testing.T) {
+	t.Parallel()
 
-	rssURI := "customrss.xml"
-	viper.Set("baseURL", "http://auth/bub/")
-	viper.Set("rssURI", rssURI)
-	viper.Set("title", "RSSTest")
+	files := `
+-- hugo.toml --
+baseURL = "http://example.com/"
+-- layouts/index.rss.xml --
+RSS Kind: {{ .Kind }}
+`
+	b := Test(t, files)
 
-	for _, s := range weightedSources {
-		writeSource(t, filepath.Join("content", "sect", s.Name), string(s.Content))
-	}
+	b.AssertFileContent("public/index.xml", "RSS Kind: home")
+}
 
-	if err := buildAndRenderSite(newSiteDefaultLang()); err != nil {
-		t.Fatalf("Failed to build site: %s", err)
-	}
+func TestRSSCanonifyURLs(t *testing.T) {
+	t.Parallel()
 
-	// Home RSS
-	assertFileContent(t, filepath.Join("public", rssURI), true, "<?xml", "rss version", "RSSTest")
-	// Section RSS
-	assertFileContent(t, filepath.Join("public", "sect", rssURI), true, "<?xml", "rss version", "Sects on RSSTest")
-	// Taxonomy RSS
-	assertFileContent(t, filepath.Join("public", "categories", "hugo", rssURI), true, "<?xml", "rss version", "Hugo on RSSTest")
+	files := `
+-- hugo.toml --
+baseURL = "http://example.com/"
+-- layouts/index.rss.xml --
+<rss>{{ range .Pages }}<item>{{ .Content | html }}</item>{{ end }}</rss>
+-- content/page.md --
+---
+Title: My Page
+---
 
+Figure:
+
+{{< figure src="/images/sunset.jpg" title="Sunset" >}}
+`
+	b := Test(t, files)
+
+	b.AssertFileContent("public/index.xml", "img src=&#34;http://example.com/images/sunset.jpg")
+}
+
+// Issue 13332.
+func TestRSSCanonifyURLsSubDir(t *testing.T) {
+	t.Parallel()
+
+	files := `
+-- hugo.toml --
+baseURL = 'https://example.org/subdir'
+disableKinds = ['section','sitemap','taxonomy','term']
+[markup.goldmark.renderHooks.image]
+useEmbedded = 'fallback'
+[markup.goldmark.renderHooks.link]
+useEmbedded = 'fallback'
+-- layouts/_markup/render-image.html --
+{{- $u := urls.Parse .Destination -}}
+{{- $src := $u.String | relURL -}}
+<img srcset="{{ $src }}" src="{{ $src }} 2x">
+<img src="{{ $src }}">
+{{- /**/ -}}
+-- layouts/home.html --
+{{ .Content }}|
+-- layouts/single.html --
+{{ .Content }}|
+-- layouts/rss.xml --
+{{ with site.GetPage "/s1/p2" }}
+  {{ .Content | transform.XMLEscape | safeHTML }}
+{{ end }}
+-- content/s1/p1.md --
+---
+title: p1
+---
+-- content/s1/p2/index.md --
+---
+title: p2
+---
+![alt](a.jpg)
+
+[p1](/s1/p1)
+-- content/s1/p2/a.jpg --
+`
+
+	b := Test(t, files)
+
+	b.AssertFileContent("public/index.xml", "https://example.org/subdir/s1/p1/")
+	b.AssertFileContent("public/index.xml",
+		"img src=&#34;https://example.org/subdir/a.jpg",
+		"img srcset=&#34;https://example.org/subdir/a.jpg&#34; src=&#34;https://example.org/subdir/a.jpg 2x")
 }

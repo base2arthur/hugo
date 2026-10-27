@@ -1,4 +1,4 @@
-// Copyright 2015 The Hugo Authors. All rights reserved.
+// Copyright 2024 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,22 +11,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package helpers
+package helpers_test
 
 import (
 	"fmt"
 	"strings"
 	"testing"
 
-	"github.com/spf13/viper"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	qt "github.com/frankban/quicktest"
+	"github.com/gohugoio/hugo/config"
 )
 
 func TestURLize(t *testing.T) {
-	initCommonTestConfig()
-
-	p := NewPathSpecFromConfig(viper.GetViper())
+	p := newTestPathSpec()
 
 	tests := []struct {
 		input    string
@@ -61,17 +58,17 @@ func TestAbsURL(t *testing.T) {
 }
 
 func doTestAbsURL(t *testing.T, defaultInSubDir, addLanguage, multilingual bool, lang string) {
-	viper.Reset()
-	viper.Set("multilingual", multilingual)
-	viper.Set("currentContentLanguage", NewLanguage(lang))
-	viper.Set("defaultContentLanguage", "en")
-	viper.Set("defaultContentLanguageInSubdir", defaultInSubDir)
+	c := qt.New(t)
 
 	tests := []struct {
 		input    string
 		baseURL  string
 		expected string
 	}{
+		// Issue 9994
+		{"foo/bar", "https://example.org/foo/", "https://example.org/foo/MULTIfoo/bar"},
+		{"/foo/bar", "https://example.org/foo/", "https://example.org/MULTIfoo/bar"},
+
 		{"/test/foo", "http://base/", "http://base/MULTItest/foo"},
 		{"/" + lang + "/test/foo", "http://base/", "http://base/" + lang + "/test/foo"},
 		{"", "http://base/ace/", "http://base/ace/MULTI"},
@@ -85,40 +82,70 @@ func doTestAbsURL(t *testing.T, defaultInSubDir, addLanguage, multilingual bool,
 		{"http//foo", "http://base/path", "http://base/path/MULTIhttp/foo"},
 	}
 
+	if multilingual && addLanguage && defaultInSubDir {
+		newTests := []struct {
+			input    string
+			baseURL  string
+			expected string
+		}{
+			{lang + "test", "http://base/", "http://base/" + lang + "/" + lang + "test"},
+			{"/" + lang + "test", "http://base/", "http://base/" + lang + "/" + lang + "test"},
+		}
+
+		tests = append(tests, newTests...)
+
+	}
+
 	for _, test := range tests {
-		viper.Set("baseURL", test.baseURL)
-		p := NewPathSpecFromConfig(viper.GetViper())
-		output := p.AbsURL(test.input, addLanguage)
-		expected := test.expected
-		if multilingual && addLanguage {
-			if !defaultInSubDir && lang == "en" {
-				expected = strings.Replace(expected, "MULTI", "", 1)
+		c.Run(fmt.Sprintf("%v/%t-%t-%t/%s", test, defaultInSubDir, addLanguage, multilingual, lang), func(c *qt.C) {
+			v := config.New()
+			if multilingual {
+				v.Set("languages", map[string]any{
+					"fr": map[string]any{
+						"weight": 20,
+					},
+					"en": map[string]any{
+						"weight": 10,
+					},
+				})
+				v.Set("defaultContentLanguage", "en")
 			} else {
-				expected = strings.Replace(expected, "MULTI", lang+"/", 1)
+				v.Set("defaultContentLanguage", lang)
+				v.Set("languages", map[string]any{
+					lang: map[string]any{
+						"weight": 10,
+					},
+				})
 			}
 
-		} else {
-			expected = strings.Replace(expected, "MULTI", "", 1)
-		}
-		if output != expected {
-			t.Fatalf("Expected %#v, got %#v\n", expected, output)
-		}
-	}
-}
+			v.Set("defaultContentLanguageInSubdir", defaultInSubDir)
+			v.Set("baseURL", test.baseURL)
 
-func TestIsAbsURL(t *testing.T) {
-	for i, this := range []struct {
-		a string
-		b bool
-	}{
-		{"http://gohugo.io", true},
-		{"https://gohugo.io", true},
-		{"//gohugo.io", true},
-		{"http//gohugo.io", false},
-		{"/content", false},
-		{"content", false},
-	} {
-		require.True(t, IsAbsURL(this.a) == this.b, fmt.Sprintf("Test %d", i))
+			var configLang string
+			if multilingual {
+				configLang = lang
+			}
+			defaultContentLanguage := lang
+			if multilingual {
+				defaultContentLanguage = "en"
+			}
+
+			p := newTestPathSpecFromCfgAndLang(v, configLang)
+
+			output := p.AbsURL(test.input, addLanguage)
+			expected := test.expected
+			if addLanguage {
+				addLanguage = defaultInSubDir && lang == defaultContentLanguage
+				addLanguage = addLanguage || (lang != defaultContentLanguage && multilingual)
+			}
+			if addLanguage {
+				expected = strings.Replace(expected, "MULTI", lang+"/", 1)
+			} else {
+				expected = strings.Replace(expected, "MULTI", "", 1)
+			}
+
+			c.Assert(output, qt.Equals, expected)
+		})
 	}
 }
 
@@ -134,12 +161,30 @@ func TestRelURL(t *testing.T) {
 	}
 }
 
-func doTestRelURL(t *testing.T, defaultInSubDir, addLanguage, multilingual bool, lang string) {
-	viper.Reset()
-	viper.Set("multilingual", multilingual)
-	viper.Set("currentContentLanguage", NewLanguage(lang))
-	viper.Set("defaultContentLanguage", "en")
-	viper.Set("defaultContentLanguageInSubdir", defaultInSubDir)
+func doTestRelURL(t testing.TB, defaultInSubDir, addLanguage, multilingual bool, lang string) {
+	t.Helper()
+	c := qt.New(t)
+	v := config.New()
+	if multilingual {
+		v.Set("languages", map[string]any{
+			"fr": map[string]any{
+				"weight": 20,
+			},
+			"en": map[string]any{
+				"weight": 10,
+			},
+		})
+		v.Set("defaultContentLanguage", "en")
+	} else {
+		v.Set("defaultContentLanguage", lang)
+		v.Set("languages", map[string]any{
+			lang: map[string]any{
+				"weight": 10,
+			},
+		})
+	}
+
+	v.Set("defaultContentLanguageInSubdir", defaultInSubDir)
 
 	tests := []struct {
 		input    string
@@ -147,166 +192,92 @@ func doTestRelURL(t *testing.T, defaultInSubDir, addLanguage, multilingual bool,
 		canonify bool
 		expected string
 	}{
+		// Issue 9994
+		{"/foo/bar", "https://example.org/foo/", false, "MULTI/foo/bar"},
+		{"foo/bar", "https://example.org/foo/", false, "/fooMULTI/foo/bar"},
+
+		// Issue 11080
+		{"mailto:a@b.com", "http://base/", false, "mailto:a@b.com"},
+		{"ftp://b.com/a.txt", "http://base/", false, "ftp://b.com/a.txt"},
+
 		{"/test/foo", "http://base/", false, "MULTI/test/foo"},
 		{"/" + lang + "/test/foo", "http://base/", false, "/" + lang + "/test/foo"},
 		{lang + "/test/foo", "http://base/", false, "/" + lang + "/test/foo"},
 		{"test.css", "http://base/sub", false, "/subMULTI/test.css"},
 		{"test.css", "http://base/sub", true, "MULTI/test.css"},
 		{"/test/", "http://base/", false, "MULTI/test/"},
-		{"/test/", "http://base/sub/", false, "/subMULTI/test/"},
+		{"test/", "http://base/sub/", false, "/subMULTI/test/"},
 		{"/test/", "http://base/sub/", true, "MULTI/test/"},
 		{"", "http://base/ace/", false, "/aceMULTI/"},
-		{"", "http://base/ace", false, "/aceMULTI"},
+		{"", "http://base/ace", false, "/aceMULTI/"},
 		{"http://abs", "http://base/", false, "http://abs"},
 		{"//schemaless", "http://base/", false, "//schemaless"},
 	}
 
+	if multilingual && addLanguage && defaultInSubDir {
+		newTests := []struct {
+			input    string
+			baseURL  string
+			canonify bool
+			expected string
+		}{
+			{lang + "test", "http://base/", false, "/" + lang + "/" + lang + "test"},
+			{"/" + lang + "test", "http://base/", false, "/" + lang + "/" + lang + "test"},
+		}
+		tests = append(tests, newTests...)
+	}
+
 	for i, test := range tests {
-		viper.Set("baseURL", test.baseURL)
-		viper.Set("canonifyURLs", test.canonify)
-		p := NewPathSpecFromConfig(viper.GetViper())
-
-		output := p.RelURL(test.input, addLanguage)
-
-		expected := test.expected
-		if multilingual && addLanguage {
-			if !defaultInSubDir && lang == "en" {
-				expected = strings.Replace(expected, "MULTI", "", 1)
-			} else {
-				expected = strings.Replace(expected, "MULTI", "/"+lang, 1)
+		c.Run(fmt.Sprintf("%v/defaultInSubDir=%t;addLanguage=%t;multilingual=%t/%s", test, defaultInSubDir, addLanguage, multilingual, lang), func(c *qt.C) {
+			v.Set("baseURL", test.baseURL)
+			v.Set("canonifyURLs", test.canonify)
+			defaultContentLanguage := lang
+			if multilingual {
+				defaultContentLanguage = "en"
 			}
-		} else {
-			expected = strings.Replace(expected, "MULTI", "", 1)
-		}
+			p := newTestPathSpecFromCfgAndLang(v, lang)
 
-		if output != expected {
-			t.Errorf("[%d][%t] Expected %#v, got %#v\n", i, test.canonify, expected, output)
-		}
+			output := p.RelURL(test.input, addLanguage)
+
+			expected := test.expected
+			if addLanguage {
+				addLanguage = defaultInSubDir && lang == defaultContentLanguage
+				addLanguage = addLanguage || (lang != defaultContentLanguage && multilingual)
+			}
+			if addLanguage {
+				expected = strings.Replace(expected, "MULTI", "/"+lang, 1)
+			} else {
+				expected = strings.Replace(expected, "MULTI", "", 1)
+			}
+
+			c.Assert(output, qt.Equals, expected, qt.Commentf("[%d] %s", i, test.input))
+		})
 	}
 }
 
-func TestSanitizeURL(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected string
-	}{
-		{"http://foo.bar/", "http://foo.bar"},
-		{"http://foo.bar", "http://foo.bar"},          // issue #1105
-		{"http://foo.bar/zoo/", "http://foo.bar/zoo"}, // issue #931
-	}
+func BenchmarkRelURL(b *testing.B) {
+	v := config.New()
+	v.Set("baseURL", "https://base/")
+	p := newTestPathSpecFromCfgAndLang(v, "")
 
-	for i, test := range tests {
-		o1 := SanitizeURL(test.input)
-		o2 := SanitizeURLKeepTrailingSlash(test.input)
-
-		expected2 := test.expected
-
-		if strings.HasSuffix(test.input, "/") && !strings.HasSuffix(expected2, "/") {
-			expected2 += "/"
-		}
-
-		if o1 != test.expected {
-			t.Errorf("[%d] 1: Expected %#v, got %#v\n", i, test.expected, o1)
-		}
-		if o2 != expected2 {
-			t.Errorf("[%d] 2: Expected %#v, got %#v\n", i, expected2, o2)
-		}
+	for b.Loop() {
+		_ = p.RelURL("https://base/foo/bar", false)
 	}
 }
 
-func TestMakePermalink(t *testing.T) {
-	type test struct {
-		host, link, output string
-	}
-
-	data := []test{
-		{"http://abc.com/foo", "post/bar", "http://abc.com/foo/post/bar"},
-		{"http://abc.com/foo/", "post/bar", "http://abc.com/foo/post/bar"},
-		{"http://abc.com", "post/bar", "http://abc.com/post/bar"},
-		{"http://abc.com", "bar", "http://abc.com/bar"},
-		{"http://abc.com/foo/bar", "post/bar", "http://abc.com/foo/bar/post/bar"},
-		{"http://abc.com/foo/bar", "post/bar/", "http://abc.com/foo/bar/post/bar/"},
-	}
-
-	for i, d := range data {
-		output := MakePermalink(d.host, d.link).String()
-		if d.output != output {
-			t.Errorf("Test #%d failed. Expected %q got %q", i, d.output, output)
+func BenchmarkAbsURL(b *testing.B) {
+	v := config.New()
+	v.Set("baseURL", "https://base/")
+	p := newTestPathSpecFromCfgAndLang(v, "")
+	b.ResetTimer()
+	b.Run("relurl", func(b *testing.B) {
+		for b.Loop() {
+			_ = p.AbsURL("foo/bar", false)
 		}
-	}
-}
-
-func TestURLPrep(t *testing.T) {
-	type test struct {
-		ugly   bool
-		input  string
-		output string
-	}
-
-	data := []test{
-		{false, "/section/name.html", "/section/name/"},
-		{true, "/section/name/index.html", "/section/name.html"},
-	}
-	for i, d := range data {
-		output := URLPrep(d.ugly, d.input)
-		if d.output != output {
-			t.Errorf("Test #%d failed. Expected %q got %q", i, d.output, output)
+	})
+	b.Run("absurl", func(b *testing.B) {
+		for b.Loop() {
+			_ = p.AbsURL("https://base/foo/bar", false)
 		}
-	}
-
-}
-
-func TestAddContextRoot(t *testing.T) {
-	tests := []struct {
-		baseURL  string
-		url      string
-		expected string
-	}{
-		{"http://example.com/sub/", "/foo", "/sub/foo"},
-		{"http://example.com/sub/", "/foo/index.html", "/sub/foo/index.html"},
-		{"http://example.com/sub1/sub2", "/foo", "/sub1/sub2/foo"},
-		{"http://example.com", "/foo", "/foo"},
-		// cannot guess that the context root is already added int the example below
-		{"http://example.com/sub/", "/sub/foo", "/sub/sub/foo"},
-		{"http://example.com/тря", "/трям/", "/тря/трям/"},
-		{"http://example.com", "/", "/"},
-		{"http://example.com/bar", "//", "/bar/"},
-	}
-
-	for _, test := range tests {
-		output := AddContextRoot(test.baseURL, test.url)
-		if output != test.expected {
-			t.Errorf("Expected %#v, got %#v\n", test.expected, output)
-		}
-	}
-}
-
-func TestPretty(t *testing.T) {
-	assert.Equal(t, PrettifyURLPath("/section/name.html"), "/section/name/index.html")
-	assert.Equal(t, PrettifyURLPath("/section/sub/name.html"), "/section/sub/name/index.html")
-	assert.Equal(t, PrettifyURLPath("/section/name/"), "/section/name/index.html")
-	assert.Equal(t, PrettifyURLPath("/section/name/index.html"), "/section/name/index.html")
-	assert.Equal(t, PrettifyURLPath("/index.html"), "/index.html")
-	assert.Equal(t, PrettifyURLPath("/name.xml"), "/name/index.xml")
-	assert.Equal(t, PrettifyURLPath("/"), "/")
-	assert.Equal(t, PrettifyURLPath(""), "/")
-	assert.Equal(t, PrettifyURL("/section/name.html"), "/section/name")
-	assert.Equal(t, PrettifyURL("/section/sub/name.html"), "/section/sub/name")
-	assert.Equal(t, PrettifyURL("/section/name/"), "/section/name")
-	assert.Equal(t, PrettifyURL("/section/name/index.html"), "/section/name")
-	assert.Equal(t, PrettifyURL("/index.html"), "/")
-	assert.Equal(t, PrettifyURL("/name.xml"), "/name/index.xml")
-	assert.Equal(t, PrettifyURL("/"), "/")
-	assert.Equal(t, PrettifyURL(""), "/")
-}
-
-func TestUgly(t *testing.T) {
-	assert.Equal(t, Uglify("/section/name.html"), "/section/name.html")
-	assert.Equal(t, Uglify("/section/sub/name.html"), "/section/sub/name.html")
-	assert.Equal(t, Uglify("/section/name/"), "/section/name.html")
-	assert.Equal(t, Uglify("/section/name/index.html"), "/section/name.html")
-	assert.Equal(t, Uglify("/index.html"), "/index.html")
-	assert.Equal(t, Uglify("/name.xml"), "/name.xml")
-	assert.Equal(t, Uglify("/"), "/")
-	assert.Equal(t, Uglify(""), "/")
+	})
 }

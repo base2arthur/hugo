@@ -1,4 +1,4 @@
-// Copyright 2016 The Hugo Authors. All rights reserved.
+// Copyright 2025 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,46 +14,36 @@
 package hugolib
 
 import (
-	"bytes"
 	"testing"
-
-	"github.com/spf13/hugo/helpers"
-	"github.com/spf13/hugo/hugofs"
-	"github.com/spf13/hugo/source"
-	"github.com/spf13/viper"
 )
 
-const robotTxtTemplate = `User-agent: Googlebot
+func TestRobotsTXTOutput(t *testing.T) {
+	t.Parallel()
+
+	files := `
+-- hugo.toml --
+baseURL = "http://auth/bub/"
+enableRobotsTXT = true
+-- layouts/robots.txt --
+User-agent: Googlebot
   {{ range .Data.Pages }}
 	Disallow: {{.RelPermalink}}
 	{{ end }}
 `
+	b := Test(t, files)
 
-func TestRobotsTXTOutput(t *testing.T) {
-	testCommonResetState()
+	b.AssertFileContent("public/robots.txt", "User-agent: Googlebot")
+}
 
-	hugofs.InitMemFs()
+func TestRobotsTXTDefaultTemplate(t *testing.T) {
+	t.Parallel()
+	files := `
+-- hugo.toml --
+baseURL = "http://auth/bub/"
+enableRobotsTXT = true
+`
 
-	viper.Set("baseURL", "http://auth/bub/")
-	viper.Set("enableRobotsTXT", true)
+	b := Test(t, files)
 
-	s := &Site{
-		Source:   &source.InMemorySource{ByteSource: weightedSources},
-		Language: helpers.NewDefaultLanguage(),
-	}
-
-	if err := buildAndRenderSite(s, "robots.txt", robotTxtTemplate); err != nil {
-		t.Fatalf("Failed to build site: %s", err)
-	}
-
-	robotsFile, err := hugofs.Destination().Open("public/robots.txt")
-
-	if err != nil {
-		t.Fatalf("Unable to locate: robots.txt")
-	}
-
-	robots := helpers.ReaderToBytes(robotsFile)
-	if !bytes.HasPrefix(robots, []byte("User-agent: Googlebot")) {
-		t.Errorf("Robots file should start with 'User-agent: Googlebot'. %s", robots)
-	}
+	b.AssertFileContent("public/robots.txt", "User-agent: *")
 }

@@ -1,4 +1,4 @@
-// Copyright 2015 The Hugo Authors. All rights reserved.
+// Copyright 2024 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,15 +13,21 @@
 
 package commands
 
-import "github.com/spf13/cobra"
+import (
+	// For time zone lookups on Windows without Go installed.
+	// See #8892
+	_ "time/tzdata"
+
+	"github.com/spf13/cobra"
+)
 
 func init() {
 	// This message to show to Windows users if Hugo is opened from explorer.exe
 	cobra.MousetrapHelpText = `
 
-  Hugo is a command-line tool for generating static website.
+  Hugo is a command-line tool for generating static websites.
 
-  You need to open cmd.exe and run Hugo from there.
-  
-  Visit http://gohugo.io/ for more information.`
+  You need to open PowerShell and run Hugo from there.
+
+  Visit https://gohugo.io/ for more information.`
 }

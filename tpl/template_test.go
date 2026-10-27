@@ -1,4 +1,4 @@
-// Copyright 2016 The Hugo Authors. All rights reserved.
+// Copyright 2025 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,300 +14,99 @@
 package tpl
 
 import (
-	"bytes"
-	"errors"
-	"html/template"
-	"io/ioutil"
-	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
-
-	"github.com/spf13/afero"
-	"github.com/spf13/hugo/hugofs"
 )
 
-// Some tests for Issue #1178 -- Ace
-func TestAceTemplates(t *testing.T) {
-
-	for i, this := range []struct {
-		basePath     string
-		innerPath    string
-		baseContent  string
-		innerContent string
-		expect       string
-		expectErr    int
-	}{
-		{"", filepath.FromSlash("_default/single.ace"), "", "{{ . }}", "DATA", 0},
-		{filepath.FromSlash("_default/baseof.ace"), filepath.FromSlash("_default/single.ace"),
-			`= content main
-  h2 This is a content named "main" of an inner template. {{ . }}`,
-			`= doctype html
-html lang=en
-  head
-    meta charset=utf-8
-    title Base and Inner Template
-  body
-    h1 This is a base template {{ . }}
-    = yield main`, `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>Base and Inner Template</title></head><body><h1>This is a base template DATA</h1></body></html>`, 0},
-	} {
-
-		for _, root := range []string{"", os.TempDir()} {
-
-			templ := New()
-
-			basePath := this.basePath
-			innerPath := this.innerPath
-
-			if basePath != "" && root != "" {
-				basePath = filepath.Join(root, basePath)
-			}
-
-			if innerPath != "" && root != "" {
-				innerPath = filepath.Join(root, innerPath)
-			}
-
-			d := "DATA"
-
-			err := templ.AddAceTemplate("mytemplate.ace", basePath, innerPath,
-				[]byte(this.baseContent), []byte(this.innerContent))
-
-			if err != nil && this.expectErr == 0 {
-				t.Errorf("Test %d with root '%s' errored: %s", i, root, err)
-			} else if err == nil && this.expectErr == 1 {
-				t.Errorf("#1 Test %d with root '%s' should have errored", i, root)
-			}
-
-			var buff bytes.Buffer
-			err = templ.ExecuteTemplate(&buff, "mytemplate.html", d)
-
-			if err != nil && this.expectErr == 0 {
-				t.Errorf("Test %d with root '%s' errored: %s", i, root, err)
-			} else if err == nil && this.expectErr == 2 {
-				t.Errorf("#2 Test with root '%s' %d should have errored", root, i)
-			} else {
-				result := buff.String()
-				if result != this.expect {
-					t.Errorf("Test %d  with root '%s' got\n%s\nexpected\n%s", i, root, result, this.expect)
-				}
-			}
-		}
+func TestStripHTML(t *testing.T) {
+	type test struct {
+		input, expected string
 	}
+	data := []test{
+		{"<h1>strip h1 tag</h1>", "strip h1 tag"},
+		{"<p> strip p tag </p>", " strip p tag "},
+		{"</br> strip br<br>", " strip br\n"},
+		{"</br> strip br2<br />", " strip br2\n"},
+		{"This <strong>is</strong> a\nnewline", "This is a newline"},
+		{"No Tags", "No Tags"},
+		{`<p>Summary Next Line.
+<figure >
 
-}
+        <img src="/not/real" />
 
-func isAtLeastGo16() bool {
-	version := runtime.Version()
-	return strings.Contains(version, "1.6") || strings.Contains(version, "1.7")
-}
 
-func TestAddTemplateFileWithMaster(t *testing.T) {
+</figure>
+.
+More text here.</p>
 
-	if !isAtLeastGo16() {
-		t.Skip("This test only runs on Go >= 1.6")
+<p>Some more text</p>`, "Summary Next Line. . More text here.\nSome more text\n"},
+
+		// Issue 9199
+		{"<div data-action='click->my-controller#doThing'>qwe</div>", "qwe"},
+		{"Hello, World!", "Hello, World!"},
+		{"foo&amp;bar", "foo&amp;bar"},
+		{`Hello <a href="www.example.com/">World</a>!`, "Hello World!"},
+		{"Foo <textarea>Bar</textarea> Baz", "Foo Bar Baz"},
+		{"Foo <!-- Bar --> Baz", "Foo Baz"},
+
+		// Issue 15462
+		{"<textarea><b>x</b></textarea>", "x"},
+		{"<script>var a = 1 < 2; document.write(\"<b>\")</script>foo", "foo"},
+		{"<STYLE>p > a { color: red }</STYLE>foo", "foo"},
+		{"<script src=\"a.js\" />foo", "foo"},
+		{"<script>foo", ""},
+		{"I <3 Hugo, 1 < 2 and 3 > 2<b>.</b>", "I <3 Hugo, 1 < 2 and 3 > 2."},
+		{"<P>a</P><p>b</p >", "a\nb\n"},
+		{"a<br/>b<BR>c<br class=\"x\">d", "a\nb\nc\nd"},
+		{`<a href="x>y" title='it"s'>t</a>`, "t"},
+		{"<!DOCTYPE html><p>x</p>", "x\n"},
+		{"<![CDATA[x<b>]]>y", "y"},
+		{"<?xml version=\"1.0\"?>y", "y"},
+		{"a<!-- <b> -->b", "ab"},
+		{"a</ b>c", "ac"},
+		{"foo <b", "foo "},
+		{"foo <", "foo <"},
+		{"a\t<b>\n </b> \u00a0 b", "a\tb"},
+		{"a\u00a0<b> </b>b", "a\u00a0b"},
+		{"<ul><li>a</li><li>b</li></ul>", "a b"},
+		{"<h2>Title</h2><div>Text</div><table><tr><td>1</td><td>2</td></tr></table>", "Title Text 1 2"},
+		{"<p>a<b>b</b>c</p><p>d</p>", "abc\nd\n"},
+		{"<svg><path d=\"M0 0\"/></svg>x", "x"},
 	}
-
-	for i, this := range []struct {
-		masterTplContent  string
-		overlayTplContent string
-		writeSkipper      int
-		expect            interface{}
-	}{
-		{`A{{block "main" .}}C{{end}}C`, `{{define "main"}}B{{end}}`, 0, "ABC"},
-		{`A{{block "main" .}}C{{end}}C{{block "sub" .}}D{{end}}E`, `{{define "main"}}B{{end}}`, 0, "ABCDE"},
-		{`A{{block "main" .}}C{{end}}C{{block "sub" .}}D{{end}}E`, `{{define "main"}}B{{end}}{{define "sub"}}Z{{end}}`, 0, "ABCZE"},
-		{`tpl`, `tpl`, 1, false},
-		{`tpl`, `tpl`, 2, false},
-		{`{{.0.E}}`, `tpl`, 0, false},
-		{`tpl`, `{{.0.E}}`, 0, false},
-	} {
-
-		hugofs.InitMemFs()
-		templ := New()
-		overlayTplName := "ot"
-		masterTplName := "mt"
-		finalTplName := "tp"
-
-		if this.writeSkipper != 1 {
-			afero.WriteFile(hugofs.Source(), masterTplName, []byte(this.masterTplContent), 0644)
-		}
-		if this.writeSkipper != 2 {
-			afero.WriteFile(hugofs.Source(), overlayTplName, []byte(this.overlayTplContent), 0644)
-		}
-
-		err := templ.AddTemplateFileWithMaster(finalTplName, overlayTplName, masterTplName)
-
-		if b, ok := this.expect.(bool); ok && !b {
-			if err == nil {
-				t.Errorf("[%d] AddTemplateFileWithMaster didn't return an expected error", i)
-			}
-		} else {
-
-			if err != nil {
-				t.Errorf("[%d] AddTemplateFileWithMaster failed: %s", i, err)
-				continue
-			}
-
-			resultTpl := templ.Lookup(finalTplName)
-
-			if resultTpl == nil {
-				t.Errorf("[%d] AddTemplateFileWithMaster: Result template not found", i)
-				continue
-			}
-
-			var b bytes.Buffer
-			err := resultTpl.Execute(&b, nil)
-
-			if err != nil {
-				t.Errorf("[%d] AddTemplateFileWithMaster execute failed: %s", i, err)
-				continue
-			}
-			resultContent := b.String()
-
-			if resultContent != this.expect {
-				t.Errorf("[%d] AddTemplateFileWithMaster got \n%s but expected \n%v", i, resultContent, this.expect)
-			}
-		}
-
-	}
-
-}
-
-// A Go stdlib test for linux/arm. Will remove later.
-// See #1771
-func TestBigIntegerFunc(t *testing.T) {
-	var func1 = func(v int64) error {
-		return nil
-	}
-	var funcs = map[string]interface{}{
-		"A": func1,
-	}
-
-	tpl, err := template.New("foo").Funcs(funcs).Parse("{{ A 3e80 }}")
-	if err != nil {
-		t.Fatal("Parse failed:", err)
-	}
-	err = tpl.Execute(ioutil.Discard, "foo")
-
-	if err == nil {
-		t.Fatal("Execute should have failed")
-	}
-
-	t.Log("Got expected error:", err)
-
-}
-
-// A Go stdlib test for linux/arm. Will remove later.
-// See #1771
-type BI struct {
-}
-
-func (b BI) A(v int64) error {
-	return nil
-}
-func TestBigIntegerMethod(t *testing.T) {
-
-	data := &BI{}
-
-	tpl, err := template.New("foo2").Parse("{{ .A 3e80 }}")
-	if err != nil {
-		t.Fatal("Parse failed:", err)
-	}
-	err = tpl.ExecuteTemplate(ioutil.Discard, "foo2", data)
-
-	if err == nil {
-		t.Fatal("Execute should have failed")
-	}
-
-	t.Log("Got expected error:", err)
-
-}
-
-// Test for bugs discovered by https://github.com/dvyukov/go-fuzz
-func TestTplGoFuzzReports(t *testing.T) {
-
-	// The following test case(s) also fail
-	// See https://github.com/golang/go/issues/10634
-	//{"{{ seq 433937734937734969526500969526500 }}", 2}}
-
-	for i, this := range []struct {
-		data      string
-		expectErr int
-	}{
-		// Issue #1089
-		//{"{{apply .C \"first\" }}", 2},
-		// Issue #1090
-		{"{{ slicestr \"000000\" 10}}", 2},
-		// Issue #1091
-		//{"{{apply .C \"first\" 0 0 0}}", 2},
-		{"{{seq 3e80}}", 2},
-		// Issue #1095
-		{"{{apply .C \"urlize\" " +
-			"\".\"}}", 2}} {
-		templ := New()
-
-		d := &Data{
-			A: 42,
-			B: "foo",
-			C: []int{1, 2, 3},
-			D: map[int]string{1: "foo", 2: "bar"},
-			E: Data1{42, "foo"},
-			F: []string{"a", "b", "c"},
-			G: []string{"a", "b", "c", "d", "e"},
-			H: "a,b,c,d,e,f",
-		}
-
-		err := templ.AddTemplate("fuzz", this.data)
-
-		if err != nil && this.expectErr == 0 {
-			t.Fatalf("Test %d errored: %s", i, err)
-		} else if err == nil && this.expectErr == 1 {
-			t.Fatalf("#1 Test %d should have errored", i)
-		}
-
-		err = templ.ExecuteTemplate(ioutil.Discard, "fuzz", d)
-
-		if err != nil && this.expectErr == 0 {
-			t.Fatalf("Test %d errored: %s", i, err)
-		} else if err == nil && this.expectErr == 2 {
-			t.Fatalf("#2 Test %d should have errored", i)
+	for i, d := range data {
+		output := StripHTML(d.input)
+		if d.expected != output {
+			t.Errorf("Test %d failed. Expected %q got %q", i, d.expected, output)
 		}
 	}
 }
 
-type Data struct {
-	A int
-	B string
-	C []int
-	D map[int]string
-	E Data1
-	F []string
-	G []string
-	H string
-}
-
-type Data1 struct {
-	A int
-	B string
-}
-
-func (Data1) Q() string {
-	return "foo"
-}
-
-func (Data1) W() (string, error) {
-	return "foo", nil
-}
-
-func (Data1) E() (string, error) {
-	return "foo", errors.New("Data.E error")
-}
-
-func (Data1) R(v int) (string, error) {
-	return "foo", nil
-}
-
-func (Data1) T(s string) (string, error) {
-	return s, nil
+func BenchmarkStripHTML(b *testing.B) {
+	const para = `<p>Lorem <em>ipsum</em> dolor sit amet, <a href="https://example.com/?a=1&amp;b=2" title="A &gt; B">consectetur</a> adipiscing elit.<br>
+Sed do eiusmod <code>tempor</code> incididunt ut labore et dolore magna aliqua.</p>
+<!-- a comment -->
+<ul>
+<li>Ut enim ad minim veniam, quis nostrud</li>
+<li>exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.</li>
+</ul>
+<pre><code class="language-go">func main() { fmt.Println("hello") }
+</code></pre>
+<p>Duis aute irure dolor in reprehenderit — in voluptate velit esse cillum dolore eu fugiat nulla pariatur.</p>
+`
+	b.Run("Small", func(b *testing.B) {
+		for b.Loop() {
+			StripHTML(`Hello <a href="www.example.com/">World</a>!`)
+		}
+	})
+	b.Run("NoTags", func(b *testing.B) {
+		for b.Loop() {
+			StripHTML("Lorem ipsum dolor sit amet, consectetur adipiscing elit.")
+		}
+	})
+	b.Run("Page", func(b *testing.B) {
+		s := strings.Repeat(para, 20)
+		for b.Loop() {
+			StripHTML(s)
+		}
+	})
 }
